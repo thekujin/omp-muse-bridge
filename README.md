@@ -156,7 +156,7 @@ settles locally after a three-second grace if Muse supplies no terminal. **Local
 termination** and is reported as unconfirmed. Pre-admission waits are also abortable. Exec cancellation stops the
 spawned process group, waits up to five seconds before `SIGKILL`, and checks termination even if the leader exited first.
 
-Activity uses Markdown `[Muse]` labels with tool names, targets, and outcomes. Raw tool output is not quoted; only bounded
+Activity streams plain tool lines with tool names, targets, and outcomes. Raw tool output is not quoted; only bounded
 change statistics, failure reasons, and referenced web hostnames are extracted. A referenced hostname is not proof the
 agent visited that site. Reasoning/activity visibility depends on OMP's thinking-display settings.
 

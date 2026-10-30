@@ -14,8 +14,7 @@ const SUCCESSOR_GRACE_MS = 5_000;
 /** Grace after a user abort before the run settles itself as cancelled, regardless of host terminals. */
 const ABORT_SETTLE_MS = 3_000;
 
-/** Markdown activity prefix; inline formatting survives OMP's thinking display. */
-const MUSE_TAG = "**[Muse]**";
+/** Activity lines stream into OMP thinking with no provider prefix; OMP already attributes them. */
 
 export class HostUnavailableError extends Error {
 	constructor(message: string, readonly cause?: unknown) {
@@ -535,37 +534,26 @@ export class TurnRun {
 			if (/todo/i.test(tool)) {
 				return;
 			} else if (!terminal) {
-				message = /^web_search$/i.test(tool)
-					? `${MUSE_TAG} 🔎 searched ${target ? `\`${target}\`` : "(query unavailable)"}`
-					: /^web_fetch$/i.test(tool)
-						? `${MUSE_TAG} 🌐 fetched ${target ? `\`${target}\`` : "(url unavailable)"}`
-						: `${MUSE_TAG} → called \`${tool}\`${target ? ` on \`${target}\`` : ""}`;
+				message = `→ called \`${tool}\`${target ? ` on \`${target}\`` : ""}`;
 			} else {
 				const sites = /^web_(search|fetch)$/i.test(tool) ? TurnRun.resultSites(item) : "";
 				const detail = sites ? `sources: ${sites}` : TurnRun.resultSummary(item) || fallback;
 				const glyph = status === "completed" ? "✓" : status === "failed" ? "✗" : "•";
 				const outcome = status === "completed" ? "finished" : status;
-				message = `${MUSE_TAG} ${glyph} \`${tool}\` ${outcome}${target ? ` on \`${target}\`` : ""}${detail ? ` — ${detail}` : ""}`;
+				message = `${glyph} \`${tool}\` ${outcome}${target ? ` on \`${target}\`` : ""}${detail ? ` — ${detail}` : ""}`;
 			}
 		} else {
-			let label: string;
-			if (kind === "reasoning") label = `${MUSE_TAG} 💭 reasoning`;
-			else if (kind === "userShell") {
-				const command = text(item.commandText).replace(/\s+/g, " ").trim();
-				label = `${MUSE_TAG} ❯ shell${command ? ` \`${command.length > 120 ? `${command.slice(0, 119)}…` : command}\`` : ""}`;
-			} else if (kind === "subagent") label = `${MUSE_TAG} 🤖 subagent${text(item.role) ? ` \`${text(item.role)}\`` : ""}`;
-			else if (kind === "workflow") label = `${MUSE_TAG} ⚙ workflow${text(item.scriptId) ? ` \`${text(item.scriptId)}\`` : ""}`;
-			else if (kind === "compaction") label = `${MUSE_TAG} 🗜 compaction`;
-			else if (kind === "reminderChild") label = `${MUSE_TAG} ⏰ reminder`;
-			else label = `${MUSE_TAG} ${kind}`;
+			// Muse-internal orchestration stays invisible: subagents, workflows, reminders, compaction,
+			// and reasoning stream no activity of their own. Only shell calls name their exact command.
+			if (kind !== "userShell") return;
+			const command = text(item.commandText).replace(/\s+/g, " ").trim();
 			const suffix = (terminal ? TurnRun.resultSummary(item) : "") || fallback;
-			message = `${label} — ${status}${suffix ? `: ${suffix}` : ""}`;
+			message = `❯ shell${command ? ` \`${command.length > 120 ? `${command.slice(0, 119)}…` : command}\`` : ""} — ${status}${suffix ? `: ${suffix}` : ""}`;
 		}
 		if (message === tracked.lastActivity) return;
 		tracked.lastActivity = message;
 		const delta = `\n\n${message}\n`;
-		if (kind === "reasoning") this.onReasoningDelta?.(delta);
-		else this.onActivityDelta?.(delta);
+		this.onActivityDelta?.(delta);
 	}
 
 	private process(method: string, params: Frame): void {
@@ -592,7 +580,6 @@ export class TurnRun {
 				if (this.interrupted) this.interruptCurrentTurn();
 			}
 			if (!startedTurnId || startedTurnId !== this.turnId) return;
-			this.onActivityDelta?.(`\n\n${MUSE_TAG} turn started\n`);
 			return;
 		}
 		if (method === "item/started" || method === "item/updated" || method === "item/completed") {
@@ -646,7 +633,7 @@ export class TurnRun {
 				return;
 			}
 			if (this.onTodoSnapshot) this.onTodoSnapshot(entries);
-			else if (entries.length) this.onActivityDelta?.(`\n\n${MUSE_TAG} plan\n${TurnRun.renderTodoLines(entries)}\n`);
+			else if (entries.length) this.onActivityDelta?.(`\n\nplan\n${TurnRun.renderTodoLines(entries)}\n`);
 			return;
 		}
 		if (method === "session/contextUsage") {

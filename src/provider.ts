@@ -349,7 +349,7 @@ export function streamMuse(
 				} catch (error) {
 					if (!(error instanceof HostUnavailableError) || options?.signal?.aborted) throw error;
 					diagnostic?.(`Muse host unavailable (${error.message}); using exec fallback`);
-					pushThinkingDelta("[Muse] Host unavailable; using exec fallback without live activity, steering or todo updates.\n");
+					pushThinkingDelta("Host unavailable; using exec fallback without live activity, steering or todo updates.\n");
 				}
 			}
 			if (options?.signal?.aborted) throw new Error("Muse turn was interrupted");

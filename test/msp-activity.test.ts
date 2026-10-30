@@ -249,6 +249,34 @@ test("web sources report one label-shaped host per site, whatever punctuation tr
 	run.settle();
 });
 
+test("activity carries no provider label and hides Muse-internal orchestration", () => {
+	const activity: string[] = [];
+	const run = new TurnRun({ host: acceptingHost(), sessionId: "session-1", onActivityDelta: (delta) => activity.push(delta.trim()) });
+	run.turnId = "turn-1";
+
+	run.handleNotification("item/started", toolItem("t0", "bash", JSON.stringify({ command: "git diff --stat", description: "Review change scope" }), "inProgress"));
+	for (const entry of [
+		{ itemId: "r1", kind: "reminderChild" },
+		{ itemId: "s1", kind: "subagent", role: "scout" },
+		{ itemId: "w1", kind: "workflow", scriptId: "critic" },
+		{ itemId: "c1", kind: "compaction" },
+		{ itemId: "n1", kind: "reasoning" },
+	]) {
+		run.handleNotification("item/started", { sessionId: "session-1", item: { ...entry, turnId: "turn-1", status: "inProgress" } });
+		run.handleNotification("item/completed", { sessionId: "session-1", item: { ...entry, turnId: "turn-1", status: "completed" } });
+	}
+	run.handleNotification("item/completed", {
+		sessionId: "session-1",
+		item: { itemId: "t0", kind: "toolCall", turnId: "turn-1", status: "completed", tool: "bash", args: JSON.stringify({ command: "git diff --stat", description: "Review change scope" }) },
+	});
+
+	const body = activity.join("\n");
+	expect(body).toContain("bash");
+	expect(body).not.toContain("[Muse]");
+	expect(body).not.toMatch(/reminder|subagent|workflow|compaction|reasoning/i);
+	run.settle();
+});
+
 test("failure results report the failure reason, never the raw output", () => {
 	const activity: string[] = [];
 	const run = new TurnRun({ host: acceptingHost(), sessionId: "session-1", onActivityDelta: (delta) => activity.push(delta.trim()) });

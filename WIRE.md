@@ -172,8 +172,9 @@ runtime-verified on the macOS development host.
 
 ## Activity, plans, and questions
 
-Activity is Markdown thinking text with a `[Muse]` tag, tool/target labels, and outcomes. Raw `visibleOutput` is not
-quoted. Extraction permits bounded statistic syntax, failure reasons, and up to five distinct referenced web hostnames.
+Activity is Markdown thinking text with plain tool/target lines and outcomes. Raw `visibleOutput` is not
+quoted. Muse-internal orchestration (subagents, workflows, reminders, compaction, reasoning items) emits no
+activity lines; only tool calls and shell commands surface. Extraction permits bounded statistic syntax, failure reasons, and up to five distinct referenced web hostnames.
 Model-authored fallback descriptions are bounded separately. Hostnames identify references, not proof of visits.
 
 Todo calls themselves are hidden. Only validated committed `session/todoListChanged` snapshots replace the plan;

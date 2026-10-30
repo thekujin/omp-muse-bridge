@@ -73,11 +73,18 @@ test("cancellation reaches a successor admitted after the parent completed", () 
 	`);
 	const result = await isolated(imports + `
 		const controller = new AbortController();
-		let steering;
+		// No activity line precedes the steered answer, so steer as soon as a live run admits it.
+		const steering = (async () => {
+			let accepted = false;
+			while (!accepted) {
+				accepted = await steerActiveMuseRuns("redirect");
+				if (!accepted) await new Promise((resolve) => setTimeout(resolve, 5));
+			}
+			assert.equal(accepted, true);
+		})();
 		try {
 			const result = await runMuseTurn({...args, signal: controller.signal, onActivityDelta: (delta) => {
 				if (delta.includes("parent_completed")) controller.abort();
-				else steering ??= steerActiveMuseRuns("redirect").then(accepted => { assert.equal(accepted, true); });
 			}});
 			await steering;
 			assert.equal(result.aborted, true);
