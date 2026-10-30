@@ -169,6 +169,8 @@ and snapshots stay out of model context. This is display-only: OMP exposes no na
 - Host usage uses Muse's counted-once prompt/total fields. Cache tokens are not added twice. Context occupancy comes
   from `session/contextUsage`, not cumulative session totals. Exec uses the counters it reports; absent usage is unknown,
   not a measured zero. Costs are catalog-based estimates, and a catalog without prices yields zero estimates.
+- Assistant messages include elapsed duration and first model-output latency for OMP statistics. Duration includes
+  startup and retries. Muse subscription-window utilization is not reported: no usage-window source is documented.
 - There are no bridge status/reset commands. `session/read` returned stored state in the observed host and is not a
   steering-liveness gate. A safe reset must clear both idle in-memory ownership and the persisted mapping; deleting a
   mapping during a run is not safe. A new OMP session provides a separate backend without deleting Muse history.

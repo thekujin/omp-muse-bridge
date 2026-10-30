@@ -155,6 +155,9 @@ export function streamMuse(
 ): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 	const output = emptyMessage(model);
+	const startedAt = performance.now();
+	const markFirstToken = () => { output.ttft ??= performance.now() - startedAt; };
+	const recordDuration = () => { output.duration = performance.now() - startedAt; };
 	const diagnostic = settings.onDiagnostic;
 
 	void (async () => {
@@ -263,6 +266,7 @@ export function streamMuse(
 
 		const finish = async () => {
 			closeOpenBlock();
+			recordDuration();
 			output.stopReason = "stop";
 			if (sessionState) {
 				sessionState.initialized = true;
@@ -293,9 +297,9 @@ export function streamMuse(
 						thinkingLevel,
 						sandboxed: settings.sandboxed === true,
 						signal: options?.signal,
-						onTextDelta: pushTextDelta,
-						onTextSnapshot: reconcileItem,
-						onReasoningDelta: options?.hideThinkingSummary ? undefined : pushThinkingDelta,
+						onTextDelta: (delta, itemId) => { if (delta) markFirstToken(); pushTextDelta(delta, itemId); },
+						onTextSnapshot: (itemId, text) => { if (text) markFirstToken(); reconcileItem(itemId, text); },
+						onReasoningDelta: options?.hideThinkingSummary ? undefined : (delta) => { if (delta) markFirstToken(); pushThinkingDelta(delta); },
 						onActivityDelta: pushThinkingDelta,
 						onTodoSnapshot: settings.onTodoSnapshot,
 					});
@@ -334,7 +338,7 @@ export function streamMuse(
 				yolo: settings.sandboxed !== true,
 				signal: options?.signal,
 				sessionId: sessionState?.sessionId,
-				onTextDelta: pushTextDelta,
+				onTextDelta: (delta) => { if (delta) markFirstToken(); pushTextDelta(delta); },
 			});
 			for (const message of result.diagnostics) diagnostic?.(message);
 			reconcileFinalText(result.output);
@@ -343,6 +347,7 @@ export function streamMuse(
 			if (sessionState && result.sessionId) sessionState.sessionId = result.sessionId;
 			await finish();
 		} catch (error) {
+			recordDuration();
 			closeOpenBlock();
 			output.stopReason = output.stopReason === "aborted" || options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = error instanceof Error ? error.message : String(error);

@@ -150,3 +150,41 @@ test("a failed first turn cannot reuse its uncommitted backend", () => temporary
 	`, { TEST_DIR: directory, XDG_DATA_HOME: data, PI_MUSE_BINARY: executable });
 	expect(result.exitCode, result.stderr).toBe(0);
 }));
+
+test("a successful stream reports duration and first-token latency", () => temporary(async (directory) => {
+	const data = await testCatalog(directory);
+	const executable = await fakeMuse(directory, `
+		function onRequest() { return false; }
+	`);
+	const result = await isolated(imports + `
+		try {
+			const result = await invoke([user("task")], "omp-timing", new Map());
+			assert.equal(result.stopReason, "stop", result.errorMessage);
+			assert.equal(answer(result), "OK");
+			assert.equal(typeof result.duration, "number");
+			assert.equal(typeof result.ttft, "number");
+			assert.ok(result.ttft <= result.duration);
+		} finally { shutdownHost(); }
+	`, { TEST_DIR: directory, XDG_DATA_HOME: data, PI_MUSE_BINARY: executable });
+	expect(result.exitCode, result.stderr).toBe(0);
+}));
+
+test("an early abort before any token reports duration without first-token latency", () => temporary(async (directory) => {
+	const data = await testCatalog(directory);
+	const executable = await fakeMuse(directory, `
+		function onRequest() { return false; }
+	`);
+	const result = await isolated(imports + `
+		const controller = new AbortController();
+		try {
+			const pending = streamMuse(model, {systemPrompt: ["# Role\\nSEED_SYSTEM"], messages: [user("task")]}, {sessionId: "omp-abort", providerSessionState: new Map(), signal: controller.signal}, {workspace: process.env.TEST_DIR}).result();
+			controller.abort();
+			const result = await pending;
+			assert.equal(result.stopReason, "aborted", result.errorMessage);
+			assert.equal(answer(result), "");
+			assert.equal(typeof result.duration, "number");
+			assert.equal(result.ttft, undefined);
+		} finally { shutdownHost(); }
+	`, { TEST_DIR: directory, XDG_DATA_HOME: data, PI_MUSE_BINARY: executable });
+	expect(result.exitCode, result.stderr).toBe(0);
+}));
