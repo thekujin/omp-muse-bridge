@@ -4,10 +4,10 @@ import { fakeMuse, isolated, temporary, testCatalog } from "./helpers.ts";
 const imports = `
 import assert from "node:assert/strict";
 import {setAgentDir} from "@oh-my-pi/pi-utils";
-import {streamMuse, getMuseProviderModels} from "./src/provider.ts";
+import {streamMuse} from "./src/provider.ts";
 import {shutdownHost} from "./src/msp.ts";
 setAgentDir(process.env.TEST_DIR);
-const model = {...getMuseProviderModels().find(model => model.id === "muse-test"), api: "muse-code-cli", provider: "muse-code", baseUrl: "http://localhost"};
+const model = {id: "muse-test", name: "Muse test", reasoning: true, input: ["text"], cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}, contextWindow: 100000, maxTokens: 10000, api: "muse-code-cli", provider: "muse-bridge", baseUrl: "http://localhost"};
 const user = text => ({role: "user", content: text, timestamp: 0});
 const invoke = (messages, sessionId, state) => streamMuse(model, {systemPrompt: ["# Role\\nSEED_SYSTEM"], messages}, {sessionId, providerSessionState: state}, {workspace: process.env.TEST_DIR}).result();
 const answer = message => message.content.filter(part => part.type === "text").map(part => part.text).join("");
@@ -146,6 +146,44 @@ test("a failed first turn cannot reuse its uncommitted backend", () => temporary
 			const next = await invoke(messages, "failed-owner", state);
 			assert.equal(next.stopReason, "stop", next.errorMessage);
 			assert.equal(answer(next), "FRESH_CONTEXT");
+		} finally { shutdownHost(); }
+	`, { TEST_DIR: directory, XDG_DATA_HOME: data, PI_MUSE_BINARY: executable });
+	expect(result.exitCode, result.stderr).toBe(0);
+}));
+
+test("a Muse mode switch reseeds, and the saved mode keeps continuity across restarts", () => temporary(async (directory) => {
+	const data = await testCatalog(directory);
+	const executable = await fakeMuse(directory, `
+		function onRequest(request) {
+			if (request.method !== "turn/start") return false;
+			const params = request.params;
+			reply(request, {turnId: params.commandId});
+			const seeded = params.input[0].text.includes("SEED_SYSTEM");
+			notify("item/completed", {sessionId: params.sessionId, item: {itemId: params.commandId, turnId: params.commandId, kind: "agentMessage", status: "completed", text: seeded ? "seed" : "resume"}});
+			notify("turn/completed", {sessionId: params.sessionId, turnId: params.commandId, terminal: "completed"});
+			return true;
+		}
+	`);
+	const result = await isolated(imports + `
+		const { readMuseSession } = await import("./src/session-store.ts");
+		const contributor = {...model, id: "muse-test-contributor"};
+		const run = (current, messages, state) => streamMuse(current, {systemPrompt: ["# Role\\nSEED_SYSTEM"], messages}, {sessionId: "mode", providerSessionState: state}, {workspace: process.env.TEST_DIR}).result();
+		const state = new Map();
+		const messages = [user("first")];
+		try {
+			const first = await run(model, messages, state);
+			assert.equal(answer(first), "seed", first.errorMessage);
+			messages.push(first, user("second"));
+			const second = await run(model, messages, state);
+			assert.equal(answer(second), "resume", second.errorMessage);
+			messages.push(second, user("switch to contributor"));
+			const switched = await run(contributor, messages, state);
+			assert.equal(answer(switched), "seed", switched.errorMessage);
+			assert.equal((await readMuseSession("mode")).contributor, true);
+			messages.push(switched, user("after switch"));
+			shutdownHost();
+			const restarted = await run(contributor, messages, new Map());
+			assert.equal(answer(restarted), "resume", restarted.errorMessage);
 		} finally { shutdownHost(); }
 	`, { TEST_DIR: directory, XDG_DATA_HOME: data, PI_MUSE_BINARY: executable });
 	expect(result.exitCode, result.stderr).toBe(0);

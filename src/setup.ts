@@ -36,7 +36,7 @@ function isManagedAgent(filePath: string, stat: fs.Stats): boolean {
 		// Definitions installed before the package rename remain managed.
 		return (meta["managed-by"] === "omp-muse-bridge" || meta["managed-by"] === "pi-muse-bridge")
 			&& meta.name === "muse-spark"
-			&& model.startsWith("muse-code/");
+			&& (model.startsWith("muse-bridge/") || model.startsWith("muse-code/"));
 	} catch {
 		return false;
 	}

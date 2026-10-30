@@ -2,26 +2,17 @@ import type { Api, AssistantMessage, AssistantMessageEventStream, Context, Model
 import { createAssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { getMuseCatalog, type MuseCatalogModel } from "./catalog.ts";
+import { getMuseCatalog, hasLiveMuseCatalog, setLiveMuseCatalog, type MuseCatalog, type MuseCatalogModel } from "./catalog.ts";
 import { runMuse } from "./runtime.ts";
-import { HostUnavailableError, type MuseTodoEntry, MuseSessionUnusableError, runMuseTurn, shutdownHost, steerActiveMuseRuns, uuidv7 } from "./msp.ts";
+import { HostUnavailableError, listMuseCatalog, type MuseTodoEntry, MuseSessionUnusableError, runMuseTurn, shutdownHost, steerActiveMuseRuns, uuidv7 } from "./msp.ts";
 import { contextCheckpoint, prepareMuseContext, type MusePromptContext } from "./context.ts";
 import { registerMusePlanDisplay } from "./plan.ts";
 import { readMuseSession, writeMuseSession, type StoredMuseSession } from "./session-store.ts";
 import type { MuseUsage } from "./contracts.ts";
+import { museUsageProvider } from "./usage.ts";
 
 const MUSE_API = "muse-code-cli" as Api;
 const ALIAS_ID = "muse-spark";
-
-const FALLBACK_MODEL: MuseCatalogModel = {
-	id: ALIAS_ID,
-	name: "Muse Spark",
-	isDefault: true,
-	isCurrent: true,
-	contextWindow: 1_000_000,
-	maxTokens: 128_000,
-	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-};
 
 function modelDefinition(model: MuseCatalogModel, id = model.id, name = model.name) {
 	return {
@@ -36,20 +27,35 @@ function modelDefinition(model: MuseCatalogModel, id = model.id, name = model.na
 	};
 }
 
-export function getMuseProviderModels() {
+/** Picker entries for a catalog: the alias tracks Muse's default row. */
+function museProviderModels(catalog: MuseCatalog) {
+	const defaultModel = catalog.models.find((model) => model.id === catalog.defaultId) ?? catalog.models[0];
+	const models = [modelDefinition(defaultModel, ALIAS_ID, `Muse default (${defaultModel.id})`),
+		...catalog.models.filter((model) => model.id !== ALIAS_ID && !model.id.endsWith("-contributor"))
+			.map((model) => modelDefinition(model))];
+	return models.flatMap((model) => [
+		model,
+		{ ...model, id: `${model.id}-contributor`, name: `${model.name} (contributor)` },
+	]);
+}
+
+/**
+ * OMP `fetchDynamicModels`: Muse's live `model/list`. The on-disk cache stands in only when that listing fails; with
+ * no cache the listing error is rethrown rather than replaced by invented models.
+ */
+export async function discoverMuseModels(sandboxed: boolean) {
+	let catalog: MuseCatalog;
 	try {
-		const catalog = getMuseCatalog();
-		const defaultModel = catalog.models.find((model) => model.id === catalog.defaultId) ?? FALLBACK_MODEL;
-		return [
-			modelDefinition(defaultModel, ALIAS_ID, `Muse Spark (catalog default: ${defaultModel.id})`),
-			...catalog.models
-				.filter((model) => model.id !== ALIAS_ID)
-				.map((model) => modelDefinition(model)),
-		];
-	} catch {
-		// Registration remains available so execution can report missing Muse setup.
-		return [modelDefinition(FALLBACK_MODEL)];
+		catalog = await listMuseCatalog(sandboxed);
+		setLiveMuseCatalog(catalog);
+	} catch (error) {
+		try {
+			catalog = getMuseCatalog();
+		} catch {
+			throw error;
+		}
 	}
+	return museProviderModels(catalog);
 }
 
 interface MuseProviderSessionState extends Omit<StoredMuseSession, "updatedAt"> {
@@ -74,6 +80,7 @@ async function persistSession(state: MuseProviderSessionState, diagnostic?: (mes
 			initialized: state.initialized,
 			checkpoint: state.checkpoint,
 			systemPrompt: state.systemPrompt,
+			contributor: state.contributor,
 		});
 	} catch (error) {
 		diagnostic?.(`Muse session continuity could not be saved: ${error instanceof Error ? error.message : String(error)}`);
@@ -84,6 +91,7 @@ async function persistSession(state: MuseProviderSessionState, diagnostic?: (mes
 async function museSessionState(
 	options: SimpleStreamOptions | undefined,
 	prepared: MusePromptContext,
+	contributor: boolean,
 	diagnostic?: (message: string) => void,
 ): Promise<MuseProviderSessionState | undefined> {
 	if (!options?.sessionId || !options.providerSessionState) return undefined;
@@ -100,6 +108,7 @@ async function museSessionState(
 			initialized: false,
 			checkpoint: prepared.checkpoint,
 			systemPrompt: prepared.systemPrompt,
+			contributor,
 			busy: true,
 			closed: false,
 			close() { this.closed = true; },
@@ -107,18 +116,23 @@ async function museSessionState(
 		options.providerSessionState.set(MUSE_API, state);
 		try {
 			const remembered = await readMuseSession(options.sessionId);
-			if (remembered) Object.assign(state, remembered);
+			// Legacy records name no mode, so their mode stays unknown and never matches the current model.
+			if (remembered) Object.assign(state, remembered, { contributor: remembered.contributor });
 		} catch (error) {
 			diagnostic?.(`Muse session continuity could not be loaded: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	} else {
 		state.busy = true;
 	}
-	if (state.checkpoint !== prepared.checkpoint || state.systemPrompt !== prepared.systemPrompt) {
+	const modeChanged = state.contributor !== contributor;
+	if (modeChanged || state.checkpoint !== prepared.checkpoint || state.systemPrompt !== prepared.systemPrompt) {
 		state.sessionId = uuidv7();
 		state.initialized = false;
-		diagnostic?.("OMP context changed; seeding a new Muse session from the current conversation");
+		diagnostic?.(modeChanged
+			? "Muse mode changed; seeding a new Muse session from the current conversation"
+			: "OMP context changed; seeding a new Muse session from the current conversation");
 	}
+	state.contributor = contributor;
 	state.systemPrompt = prepared.systemPrompt;
 	// An interrupted process must not leave a checkpoint claiming unfinished work was committed.
 	state.checkpoint = undefined;
@@ -159,6 +173,7 @@ export function streamMuse(
 	const markFirstToken = () => { output.ttft ??= performance.now() - startedAt; };
 	const recordDuration = () => { output.duration = performance.now() - startedAt; };
 	const diagnostic = settings.onDiagnostic;
+	const contributor = model.id.endsWith("-contributor");
 
 	void (async () => {
 		let sessionState: MuseProviderSessionState | undefined;
@@ -281,9 +296,17 @@ export function streamMuse(
 		try {
 			stream.push({ type: "start", partial: output });
 			if (options?.signal?.aborted) throw new Error("Muse turn was interrupted");
+			// Execution resolves model IDs against Muse's live list; the local cache is used only when that listing fails.
+			if (!hasLiveMuseCatalog()) {
+				try {
+					setLiveMuseCatalog(await listMuseCatalog(settings.sandboxed === true));
+				} catch (error) {
+					diagnostic?.(`Muse model/list unavailable; resolving models from the local cache (${error instanceof Error ? error.message : String(error)})`);
+				}
+			}
 			const workspace = settings.workspace ?? process.cwd();
 			const prepared = prepareMuseContext(context, workspace);
-			sessionState = await museSessionState(options, prepared, diagnostic);
+			sessionState = await museSessionState(options, prepared, contributor, diagnostic);
 			const thinkingLevel = options?.disableReasoning ? "off" : options?.reasoning;
 			if (sessionState) {
 				try {
@@ -374,7 +397,7 @@ export function registerMuseProvider(pi: ExtensionAPI): void {
 		default: false,
 	});
 	pi.on("input", async (event, ctx) => {
-		if (event.source !== "interactive" || ctx.model?.provider !== "muse-code") return;
+		if (event.source !== "interactive" || ctx.model?.provider !== "muse-bridge") return;
 		// Commands and explicit OMP queue markers retain OMP's parsing semantics.
 		const trimmed = event.text.trimStart();
 		if (trimmed.startsWith("/") || trimmed.startsWith("->") || trimmed.startsWith("=>")) return;
@@ -394,11 +417,22 @@ export function registerMuseProvider(pi: ExtensionAPI): void {
 		return { render: () => [`↳ steered Muse: ${lines[0] ?? ""}`, ...lines.slice(1).map((line) => `  ${line}`)] };
 	});
 	pi.on("session_shutdown", () => shutdownHost());
-	pi.registerProvider("muse-code", {
+	pi.on("session_stop", async (_event, ctx) => {
+		if (ctx.model?.provider !== "muse-bridge") return;
+		try {
+			const usage = ctx.modelRegistry.authStorage;
+			await usage.invalidateUsageCache("muse-bridge");
+			await usage.fetchUsageReports();
+		} catch {
+			// Usage refresh must not fail a completed turn.
+		}
+	});
+	pi.registerProvider("muse-bridge", {
 		baseUrl: "http://localhost",
-		apiKey: "muse-code-local",
+		apiKey: "muse-bridge-local",
 		api: MUSE_API,
-		models: getMuseProviderModels(),
+		usage: museUsageProvider,
+		fetchDynamicModels: () => discoverMuseModels(pi.getFlag("muse-sandboxed") === true || sandboxedFromEnvironment()),
 		streamSimple: (model, context, options) => streamMuse(model, context, options, {
 			sandboxed: pi.getFlag("muse-sandboxed") === true || sandboxedFromEnvironment(),
 			onDiagnostic: (message) => pi.logger.warn("omp-muse-bridge diagnostic", { message }),

@@ -34,6 +34,14 @@ test("concurrent installations publish one complete definition", () => temporary
 	expect(await fs.stat(destination).catch(() => undefined)).toBeUndefined();
 }));
 
+test("setup upgrades the previously managed provider model", () => temporary(async (directory) => {
+	const destination = path.join(directory, "muse-spark.md");
+	const bundled = await fs.readFile(getBundledAgentPath(), "utf8");
+	await fs.writeFile(destination, bundled.replace("muse-bridge/", "muse-code/"));
+	expect((await installMuseAgent(directory)).status).toBe("updated");
+	expect(await fs.readFile(destination, "utf8")).toBe(bundled);
+}));
+
 test("unrelated definitions survive both setup and removal", () => temporary(async (directory) => {
 	const destination = path.join(directory, "muse-spark.md");
 	const original = "An agent managed by its user, not the bridge.\n";

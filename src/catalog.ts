@@ -39,6 +39,17 @@ interface CatalogRow {
 
 let cache: (MuseCatalog & { signature: string }) | null = null;
 
+/** Live `model/list` result adopted for this process; it takes precedence over the on-disk cache. */
+let liveCatalog: MuseCatalog | null = null;
+
+export function setLiveMuseCatalog(catalog: MuseCatalog): void {
+	liveCatalog = catalog;
+}
+
+export function hasLiveMuseCatalog(): boolean {
+	return liveCatalog !== null;
+}
+
 function getCatalogDir(): string {
 	const dataHome = process.env.XDG_DATA_HOME?.trim() || path.join(os.homedir(), ".local/share");
 	return path.join(dataHome, "muse/model-catalog");
@@ -127,14 +138,14 @@ export function getMuseCatalog(): MuseCatalog {
 export function stripProviderPrefix(raw: string): string {
 	const trimmed = raw.trim();
 	const lower = trimmed.toLowerCase();
-	for (const prefix of ["muse-code/", "muse/", "meta/", "muse:"]) {
+	for (const prefix of ["muse-bridge/", "muse/", "meta/", "muse:"]) {
 		if (lower.startsWith(prefix)) return trimmed.slice(prefix.length).trim();
 	}
 	return trimmed;
 }
 
 export function resolveMuseModelId(model?: string): string {
-	const catalog = getMuseCatalog();
+	const catalog = liveCatalog ?? getMuseCatalog();
 	const bare = stripProviderPrefix(model ?? "");
 	if (!bare || ["muse-spark", "spark"].includes(bare.toLowerCase())) return catalog.defaultId;
 	const match = catalog.models.find((candidate) => candidate.id.toLowerCase() === bare.toLowerCase());
@@ -144,4 +155,25 @@ export function resolveMuseModelId(model?: string): string {
 		);
 	}
 	return match.id;
+}
+
+/** Model-selector suffix that selects Muse contributor mode; it is never part of a Muse model id. */
+export const CONTRIBUTOR_SUFFIX = "-contributor";
+
+export interface MuseModelSelection {
+	modelId: string;
+	contributor: boolean;
+}
+
+/** Split `<model>[-contributor]`; the suffix is stripped before Muse model id resolution. */
+export function parseMuseModelSelector(model?: string): { base: string; contributor: boolean } {
+	const bare = stripProviderPrefix(model ?? "");
+	const contributor = bare.toLowerCase().endsWith(CONTRIBUTOR_SUFFIX);
+	return { base: contributor ? bare.slice(0, -CONTRIBUTOR_SUFFIX.length).trim() : bare, contributor };
+}
+
+/** Resolve a selector to the base Muse model id (live `model/list`) and its contributor mode. */
+export function resolveMuseSelection(model?: string): MuseModelSelection {
+	const { base, contributor } = parseMuseModelSelector(model);
+	return { modelId: resolveMuseModelId(base), contributor };
 }

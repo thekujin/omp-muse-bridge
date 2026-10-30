@@ -43,12 +43,12 @@ export function registerMusePlanDisplay(pi: ExtensionAPI): MusePlanDisplay {
 		const ctx = current;
 		if (!ctx?.hasUI) return;
 		const owner = ctx.sessionManager.getSessionId();
-		if (!latest.length || ctx.models.current()?.provider !== "muse-code") {
+		if (!latest.length || ctx.models.current()?.provider !== "muse-bridge") {
 			ctx.ui.setWidget(PLAN_TYPE, undefined);
 			return;
 		}
 		ctx.ui.setWidget(PLAN_TYPE, (_tui, theme) => ({
-			render: () => current?.sessionManager.getSessionId() === owner && ctx.models.current()?.provider === "muse-code"
+			render: () => current?.sessionManager.getSessionId() === owner && ctx.models.current()?.provider === "muse-bridge"
 				? renderPlan(latest, theme)
 				: [],
 		}));

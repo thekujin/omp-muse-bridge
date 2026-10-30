@@ -1,7 +1,7 @@
 # omp-muse-bridge
 
 An [Oh My Pi](https://github.com/can1357/oh-my-pi) plugin that registers an authenticated
-[Muse Code](https://github.com/meta-pytorch/muse) installation as the OMP model provider `muse-code`.
+[Muse Code](https://github.com/meta-pytorch/muse) installation as the OMP model provider `muse-bridge`.
 
 Muse owns tool execution. OMP displays its replies, reasoning, short activity summaries, and committed todo snapshots.
 A persistent `muse serve` host keeps backend context between matching turns. The bundled `muse-spark` agent lets
@@ -22,13 +22,15 @@ These screenshots show the earlier panel layout. Plans now use a live widget and
 ## Requirements
 
 - OMP 18.1.10 or later, including its `@oh-my-pi/pi-ai`, `pi-catalog`, `pi-coding-agent`, and `pi-utils` packages
-- Muse on `PATH`, authenticated with `muse login`, with a populated local model catalog
+- Muse on PATH, authenticated with muse login (a populated local model catalog is an optional fallback)
 - Bun 1.3.14 or later for development and the test runner
 
-The bridge reads Muse's cache at `$XDG_DATA_HOME/muse/model-catalog`, or `~/.local/share/muse/model-catalog` when
-`XDG_DATA_HOME` is unset. It does not download or rebuild the catalog. Authentication alone does not prove the cache
-is available: if it is missing, open Muse normally and verify its model picker and a normal turn before retrying OMP.
-There is no catalog-refresh subcommand in the inspected Muse CLI help.
+The picker and execution use Muse's live model list from `muse serve`'s `model/list`, which the bridge queries over a
+one-shot stdio handshake when OMP discovers models. OMP caches that discovery result for its model-cache TTL. If the live
+listing fails, the bridge reads Muse's local cache at `$XDG_DATA_HOME/muse/model-catalog` (or
+`~/.local/share/muse/model-catalog`) when it exists. It never invents models: with neither source, no models are
+registered and the listing error is returned to OMP. Verify `muse login` and that `muse serve` answers `model/list`
+before retrying OMP.
 
 `PI_MUSE_BINARY=/path/to/muse` selects the executable for both the persistent host and exec fallback.
 
@@ -59,10 +61,10 @@ are refused. `/muse-remove` removes only the managed agent definition, not the p
 For an explicit non-contributor model:
 
 ```text
-/model muse-code/muse-spark-1.3
+/model muse-bridge/muse-spark-1.3
 ```
 
-The bundled delegated agent also pins `muse-code/muse-spark-1.3`. Ask OMP, for example:
+The bundled delegated agent also pins `muse-bridge/muse-spark-1.3`. Ask OMP, for example:
 
 ```text
 Use the muse-spark agent to explain this repository.
@@ -89,28 +91,30 @@ task({
 
 ## Models and privacy
 
-Every model in the local Muse catalog is registered as `muse-code/<model-id>`. The inspected catalog exposes:
+Every model in Muse's live `model/list` is registered as `muse-bridge/<model-id>`. The inspected listing (Muse 1.4.14,
+provider `meta`, profile `tbh`) exposed:
 
-- `muse-code/muse-spark-1.3`
-- `muse-code/muse-spark-1.3-contributor`
-- `muse-code/muse-spark-1.2`
-- `muse-code/muse-spark-1.2-contributor`
+- `muse-bridge/muse-wonder-1.0` (default)
+- `muse-bridge/muse-spark-1.3`
+- `muse-bridge/muse-spark-1.2`
 
-`muse-code/muse-spark` is an additional alias for the catalog's `is_default` row, **not** Muse's configured/current model.
-The picker label includes the resolved ID. In the inspected catalog the alias selects `muse-spark-1.3-contributor`,
-while Muse settings select `muse-spark-1.3`.
+Each model also has a `-contributor` selector, for example `muse-bridge/muse-wonder-1.0-contributor`.
+Selectors without the suffix explicitly run with contributor mode off; suffixed selectors run with it on.
+`muse-bridge/muse-spark` and `muse-bridge/muse-spark-contributor` select the listing's default model in the
+respective mode, not a fixed model. The picker label includes the resolved ID.
 
-The contributor model description says content, including inter-session messages, may be used for product improvement.
-Choose an explicit non-contributor ID when that distinction matters. Seeding forwards OMP instructions and conversation
-context to the selected Muse model, including bounded tool-result excerpts.
+Contributor-mode content, including inter-session messages, may be used for product improvement. Switching modes
+starts a new Muse backend session seeded from the current OMP conversation, including instructions and bounded
+tool-result excerpts. Standard and contributor turns use separate Muse host processes.
 
-Model registration happens at plugin startup. Restart OMP after Muse changes its catalog. The bridge merges local cache
-files by model ID; it does not select a Muse provider/profile or pass provider/profile overrides to either transport.
+Model discovery runs when OMP discovers models, and OMP caches its result for 24 hours; restart OMP or refresh its models
+after Muse changes its model list. The bridge does not select a Muse provider/profile or pass provider/profile overrides
+to either transport.
 The supported configuration is Muse's standard Meta provider with a single catalog profile. Multiple provider/profile
 caches are not independently routable through this bridge.
 
-Missing, corrupt, or unknown catalog data raises an execution error. An alias-only placeholder keeps the provider
-registered if setup is missing; it does not make Muse available or bypass authentication.
+Unknown model IDs raise an execution error. When neither the live listing nor the local cache is available, no models
+are registered and the listing error is returned to OMP; no placeholder alias is substituted.
 
 OMP thinking levels map to Muse reasoning effort, including `off` to `none` and `max` to `ultra`. Availability still
 depends on the selected Muse model and service.
@@ -140,7 +144,7 @@ full seeded context too. Neither transport has an overall model-execution timeou
 
 ## Steering, cancellation, and display
 
-Interactive input is offered to Muse only when `muse-code` is the active provider and a run is live and uninterrupted.
+Interactive input is offered to Muse only when `muse-bridge` is the active provider and a run is live and uninterrupted.
 Slash commands and OMP's `->` / `=>` queue markers retain OMP parsing. A refused steer falls through to OMP.
 
 Steering is not a mid-generation interrupt. Muse may answer a late steer in a successor run. The bridge reconciles
@@ -170,7 +174,8 @@ and snapshots stay out of model context. This is display-only: OMP exposes no na
   from `session/contextUsage`, not cumulative session totals. Exec uses the counters it reports; absent usage is unknown,
   not a measured zero. Costs are catalog-based estimates, and a catalog without prices yields zero estimates.
 - Assistant messages include elapsed duration and first model-output latency for OMP statistics. Duration includes
-  startup and retries. Muse subscription-window utilization is not reported: no usage-window source is documented.
+  startup and retries. Subscription utilization is read from `muse usage --json` (five-hour and weekly windows);
+  an authorized Muse CLI supporting that command is required. Unavailable or malformed usage is not reported as zero.
 - There are no bridge status/reset commands. `session/read` returned stored state in the observed host and is not a
   steering-liveness gate. A safe reset must clear both idle in-memory ownership and the persisted mapping; deleting a
   mapping during a run is not safe. A new OMP session provides a separate backend without deleting Muse history.

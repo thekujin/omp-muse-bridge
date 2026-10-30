@@ -12,6 +12,8 @@ export interface StoredMuseSession {
 	checkpoint?: string;
 	/** Hash of the seeded operating instructions and workspace identity. */
 	systemPrompt?: string;
+	/** Whether the session was seeded for a `-contributor` model; absent on legacy records, which leaves the mode unknown. */
+	contributor?: boolean;
 	/** Epoch ms of the last write; drives recency pruning. */
 	updatedAt: number;
 }
@@ -55,11 +57,15 @@ function parseStoredSession(ompSessionId: string, value: unknown, file: string):
 	if (record.systemPrompt !== undefined && typeof record.systemPrompt !== "string") {
 		throw storeError(`${file} entry "${ompSessionId}" has an invalid systemPrompt`);
 	}
+	if (record.contributor !== undefined && typeof record.contributor !== "boolean") {
+		throw storeError(`${file} entry "${ompSessionId}" has an invalid contributor flag`);
+	}
 	return {
 		sessionId: record.sessionId,
 		initialized: record.initialized,
 		checkpoint: record.checkpoint as string | undefined,
 		systemPrompt: record.systemPrompt as string | undefined,
+		contributor: record.contributor as boolean | undefined,
 		updatedAt: record.updatedAt,
 	};
 }

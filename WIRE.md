@@ -39,8 +39,10 @@ command ID, so the bridge registers that ID before sending the request and can a
 | `userInput/cancel` | `commandId`, `sessionId`, `userInputId`, `reason` | settles the question as cancelled |
 | `view/page` | `sessionId`, `direction:"forward"`, `limit:1000`, optional durable `cursor` | `{events,nextCursor,...}` |
 
-`model/list` is available for discovery probes but is not used for ordinary registration; registration reads Muse's
-local catalog. `turn/cancel`, `turn/unqueue`, and `approval/decide` exist in the schema but are not used by the bridge.
+`model/list` is the live model source. Discovery and execution model-ID resolution call it through a one-shot `muse serve`
+handshake (`initialize`, `initialized`, `model/list`, then the host is disposed); the local catalog is read only when that
+listing fails. Rows map `modelId`, `displayLabel`, `isDefault`, `isActive`, `contextLimit`, and `outputLimit`; `cost` is
+`null` in the inspected listing. `turn/cancel`, `turn/unqueue`, and `approval/decide` exist in the schema but are not used by the bridge.
 
 The wire `ApprovalMode` values are `allowAll`, `promptUnmatched`, `onRequest`, and `denyUnmatched`. The CLI's `never`
 spelling is not a valid wire value. Unrestricted parity combines wire `allowAll` with the default host flags.
@@ -144,7 +146,7 @@ must not clear a subsequent request's busy state.
 
 ## Steering and cancellation
 
-OMP's input hook requires interactive input and an active `muse-code` model. Slash commands and explicit queue markers
+OMP's input hook requires interactive input and an active `muse-bridge` model. Slash commands and explicit queue markers
 are left to OMP. A run refuses steering once interrupted, settled, terminal, or held waiting for a successor. A refused
 or rejected steer falls through to OMP rather than disappearing.
 

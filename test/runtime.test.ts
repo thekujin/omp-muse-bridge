@@ -9,8 +9,9 @@ import assert from "node:assert/strict";
 import * as cp from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-let frames = [];
-spyOn(cp, "spawn").mockImplementation(() => {
+let frames = [], argsSeen;
+spyOn(cp, "spawn").mockImplementation((_binary, args) => {
+	argsSeen = args;
 	const child = new EventEmitter();
 	child.stdout = new PassThrough(); child.stderr = new PassThrough();
 	setImmediate(() => {
@@ -39,6 +40,19 @@ test("exec preserves text when UTF-8 characters cross chunk boundaries", () => t
 		const result = await runMuse({...request, onTextDelta: value => streamed += value});
 		assert.equal(streamed, expected);
 		assert.equal(result.output, expected);
+	`, { TEST_DIR: directory, XDG_DATA_HOME: data });
+	expect(result.exitCode, result.stderr).toBe(0);
+}));
+
+test("exec routes contributor and standard selectors to the matching Muse mode", () => temporary(async (directory) => {
+	const data = await testCatalog(directory);
+	const result = await isolated(streamFixture + `
+		frames = [{payload_type: "run.terminal.completed", payload: {text: "done"}}];
+		await runMuse({...request, model: "muse-test-contributor"});
+		assert.equal(argsSeen[argsSeen.indexOf("--contributor-mode") + 1], "on");
+		assert.equal(argsSeen[argsSeen.indexOf("--model") + 1], "muse-test");
+		await runMuse(request);
+		assert.equal(argsSeen[argsSeen.indexOf("--contributor-mode") + 1], "off");
 	`, { TEST_DIR: directory, XDG_DATA_HOME: data });
 	expect(result.exitCode, result.stderr).toBe(0);
 }));

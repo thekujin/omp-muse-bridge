@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { parseFrontmatter } from "@oh-my-pi/pi-utils";
-import { resolveMuseModelId } from "./catalog.ts";
+import { resolveMuseSelection } from "./catalog.ts";
 import { errorMessage } from "./utils.ts";
 
 export { type MuseThinkingLevel, type MuseUsage } from "./contracts.ts";
@@ -52,8 +52,9 @@ export function getMuseExecArgs(
 	yolo = true,
 	thinkingLevel?: MuseThinkingLevel,
 	sessionId?: string,
+	contributor = false,
 ): string[] {
-	const args = ["exec", "--json", "--prompt-file", promptFile, "--workspace", workspace, "--user-input-auto-resolve"];
+	const args = ["exec", "--json", "--prompt-file", promptFile, "--workspace", workspace, "--user-input-auto-resolve", "--contributor-mode", contributor ? "on" : "off"];
 	if (sessionId) args.push("--session-id", sessionId);
 	if (yolo) args.push("--yolo");
 	else args.push("--trust-workspace", "--disable-approval");
@@ -188,7 +189,7 @@ export async function runMuse(request: MuseRunRequest): Promise<MuseRunResult> {
 	}
 	if (!stat.isDirectory()) throw new Error(`Muse workspace is not a directory: ${request.cwd}`);
 
-	const model = resolveMuseModelId(request.model);
+	const { modelId: model, contributor } = resolveMuseSelection(request.model);
 	const temporary = await writeMusePrompt(request.prompt);
 	let stderr = "";
 	let streamedOutput = "";
@@ -211,6 +212,7 @@ export async function runMuse(request: MuseRunRequest): Promise<MuseRunResult> {
 			request.yolo !== false,
 			request.thinkingLevel,
 			request.sessionId,
+			contributor,
 		);
 		const exitCode = await new Promise<number>((resolve) => {
 			const useProcessGroup = process.platform !== "win32";

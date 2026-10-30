@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import { errorMessage } from "./utils.ts";
 import { museThinkingLevel, type MuseThinkingLevel, type MuseUsage } from "./contracts.ts";
-import { resolveMuseModelId } from "./catalog.ts";
+import { parseMuseModelSelector, resolveMuseModelId, type MuseCatalog, type MuseCatalogModel } from "./catalog.ts";
 
 /** Muse Session Protocol client over newline-delimited JSON-RPC stdio. */
 
@@ -149,7 +149,7 @@ class MuseHost {
 	readonly exitPromise: Promise<never>;
 	private readonly exitResolvers: { reject: (error: Error) => void };
 
-	private constructor(readonly child: ChildProcess) {
+	private constructor(readonly child: ChildProcess, readonly contributor: boolean) {
 		const { promise, reject } = Promise.withResolvers<never>();
 		this.exitPromise = promise;
 		this.exitResolvers = { reject };
@@ -185,15 +185,16 @@ class MuseHost {
 		});
 	}
 
-	static async connect(sandboxed: boolean): Promise<MuseHost> {
+	static async connect(sandboxed: boolean, contributor: boolean): Promise<MuseHost> {
 		const args = sandboxed ? ["serve", "--trust-workspace"] : ["serve", "--disable-sandbox", "--trust-workspace"];
+		args.push("--contributor-mode", contributor ? "on" : "off");
 		let child: ChildProcess;
 		try {
 			child = spawn(process.env.PI_MUSE_BINARY?.trim() || "muse", args, { stdio: ["pipe", "pipe", "pipe"] });
 		} catch (error) {
 			throw new HostUnavailableError(`failed to spawn muse serve: ${errorMessage(error)}`, error);
 		}
-		const host = new MuseHost(child);
+		const host = new MuseHost(child, contributor);
 		try {
 			await host.request("initialize", { clientInfo: HOST_CLIENT_INFO }, 15_000);
 			host.notify("initialized", {});
@@ -289,15 +290,63 @@ class MuseHost {
 	}
 }
 
+/**
+ * Live Muse model list: a one-shot `muse serve` handshake and `model/list`. The host serves only this request and is
+ * disposed afterward; it is never shared with session hosts.
+ */
+export async function listMuseCatalog(sandboxed: boolean): Promise<MuseCatalog> {
+	const host = await MuseHost.connect(sandboxed, false);
+	try {
+		const result = await host.request("model/list", {}, 30_000);
+		const models: MuseCatalogModel[] = [];
+		for (const row of Array.isArray(result.models) ? result.models : []) {
+			const record = asRecord(row);
+			const id = text(record?.modelId);
+			if (!record || !id) continue;
+			const prices = asRecord(record.cost);
+			const price = (value: unknown) => {
+				const parsed = typeof value === "string" ? Number(value) : numeric(value);
+				return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+			};
+			models.push({
+				id,
+				name: text(record.displayLabel) || id,
+				isDefault: record.isDefault === true,
+				isCurrent: record.isActive === true,
+				contextWindow: numeric(record.contextLimit),
+				maxTokens: numeric(record.outputLimit),
+				cost: prices && (prices.currency == null || prices.currency === "USD")
+					? { input: price(prices.input), output: price(prices.output), cacheRead: price(prices.cached), cacheWrite: 0 }
+					: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			});
+		}
+		if (models.length === 0) throw new Error("muse serve model/list returned no models");
+		const defaultId = (models.find((model) => model.isDefault) ?? models[0]).id;
+		return { models, defaultId };
+	} finally {
+		host.dispose();
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Host management and active-run registry
 
-let hostPromise: Promise<MuseHost> | null = null;
+type ContributorMode = "on" | "off";
 
-let activeHost: MuseHost | null = null;
-/** Sandbox posture of the live host: the host is shared, so reuse requires the identical spawn. */
-let activeHostSandboxed: boolean | undefined;
+/** One shared host per contributor mode: standard and contributor turns never share a host process. */
+interface HostSlot {
+	host: MuseHost | null;
+	/** Sandbox posture of the live host: the host is shared, so reuse requires the identical spawn. */
+	sandboxed: boolean | undefined;
+	promise: Promise<MuseHost> | null;
+}
+const hostSlots: Record<ContributorMode, HostSlot> = {
+	on: { host: null, sandboxed: undefined, promise: null },
+	off: { host: null, sandboxed: undefined, promise: null },
+};
 const sessionsOnHost = new Map<string, MuseHost>();
+/** Mode each session was opened in; kept across host restarts so a session never changes modes. */
+const sessionModes = new Map<string, boolean>();
 
 const sessionModelOnHost = new Map<string, string>();
 
@@ -833,48 +882,56 @@ function hostListener(method: string, params: Frame): void {
 	activeRuns.get(text(params.sessionId))?.handleNotification(method, params);
 }
 
-export async function ensureHost(sandboxed: boolean): Promise<MuseHost> {
-	if (activeHost && !activeHost.dead && activeHostSandboxed === sandboxed) return activeHost;
-	if (activeHost && !activeHost.dead && activeHostSandboxed !== sandboxed) {
-		if (activeRuns.size) throw new Error("Cannot change Muse sandbox posture while a host turn is active");
-		shutdownHost();
+/** Forget a slot's host and the sessions bound to it; the caller disposes the returned host. */
+function resetHostSlot(mode: ContributorMode): MuseHost | null {
+	const slot = hostSlots[mode];
+	const host = slot.host;
+	slot.host = null;
+	slot.sandboxed = undefined;
+	slot.promise = null;
+	if (host) {
+		for (const [key, value] of [...sessionsOnHost]) if (value === host) {
+			sessionsOnHost.delete(key);
+			sessionModelOnHost.delete(key);
+		}
 	}
-	if (!hostPromise) {
-		hostPromise = MuseHost.connect(sandboxed)
+	return host;
+}
+
+export async function ensureHost(sandboxed: boolean, contributor: boolean): Promise<MuseHost> {
+	const mode: ContributorMode = contributor ? "on" : "off";
+	const slot = hostSlots[mode];
+	if (slot.host && !slot.host.dead && slot.sandboxed === sandboxed) return slot.host;
+	if (slot.host && !slot.host.dead && slot.sandboxed !== sandboxed) {
+		if (activeRuns.size) throw new Error("Cannot change Muse sandbox posture while a host turn is active");
+		resetHostSlot(mode)?.dispose();
+	}
+	if (!slot.promise) {
+		slot.promise = MuseHost.connect(sandboxed, contributor)
 			.then((host) => {
-				activeHost = host;
-				activeHostSandboxed = sandboxed;
+				slot.host = host;
+				slot.sandboxed = sandboxed;
 				host.onNotification(hostListener);
 				host.exitPromise.catch(() => {
-					if (activeHost === host) {
-						activeHost = null;
-						activeHostSandboxed = undefined;
-						hostPromise = null;
-						for (const [key, value] of [...sessionsOnHost]) if (value === host) {
-							sessionsOnHost.delete(key);
-							sessionModelOnHost.delete(key);
-						}
-					}
+					if (slot.host === host) resetHostSlot(mode);
 				});
 				return host;
 			})
 			.catch((error: unknown) => {
-				hostPromise = null;
+				slot.promise = null;
 				throw error;
 			});
 	}
-	return hostPromise;
+	return slot.promise;
 }
 
 export function shutdownHost(): void {
-	const host = activeHost;
-	activeHost = null;
-	activeHostSandboxed = undefined;
-	hostPromise = null;
+	const hosts = [resetHostSlot("on"), resetHostSlot("off")];
 	sessionsOnHost.clear();
 	sessionModelOnHost.clear();
+	sessionModes.clear();
 	activeRuns.clear();
-	host?.dispose();
+	for (const host of hosts) host?.dispose();
 }
 
 /** Route user input only to a live Muse run in this process. */
@@ -965,10 +1022,16 @@ function abortable<T>(request: Promise<T>, signal?: AbortSignal): Promise<T> {
 /** Run a host turn; fallback is allowed only when no turn/start request has been sent. */
 export async function runMuseTurn(args: MuseTurnArgs): Promise<MuseTurnOutcome> {
 	if (args.signal?.aborted) return abortedBeforeAdmission();
-	const museModelId = resolveMuseModelId(args.modelId);
+	// The mode comes from the raw selector: the contributor suffix never reaches the Muse model id.
+	const selection = parseMuseModelSelector(args.modelId);
+	const museModelId = resolveMuseModelId(selection.base);
+	const sessionMode = sessionModes.get(args.sessionId);
+	if (sessionMode !== undefined && sessionMode !== selection.contributor) {
+		throw new Error(`Muse session ${args.sessionId} was opened in ${sessionMode ? "contributor" : "standard"} mode; start a new session to use ${selection.contributor ? "contributor" : "standard"} mode`);
+	}
 	let host: MuseHost;
 	try {
-		host = await abortable(ensureHost(args.sandboxed), args.signal);
+		host = await abortable(ensureHost(args.sandboxed, selection.contributor), args.signal);
 	} catch (error) {
 		if (args.signal?.aborted) return abortedBeforeAdmission();
 		throw error;
@@ -1022,6 +1085,7 @@ export async function runMuseTurn(args: MuseTurnArgs): Promise<MuseTurnOutcome> 
 				throw new MuseSessionUnusableError(`Muse session ${args.sessionId} has an empty viewCursor and cannot be observed`);
 			}
 			sessionsOnHost.set(args.sessionId, host);
+			sessionModes.set(args.sessionId, selection.contributor);
 			createdSession = openedWithStart;
 			if (createdSession) sessionModelOnHost.set(args.sessionId, museModelId);
 		}

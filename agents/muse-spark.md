@@ -1,7 +1,7 @@
 ---
 name: muse-spark
 description: Run an autonomous Muse Spark coding subagent through Muse Code using existing Meta authentication.
-model: muse-code/muse-spark-1.3
+model: muse-bridge/muse-spark-1.3
 managed-by: omp-muse-bridge
 ---
 
