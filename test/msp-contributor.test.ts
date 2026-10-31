@@ -39,8 +39,8 @@ test("standard and contributor turns spawn separate hosts with matching --contri
 	`, environment(directory, data, executable));
 	expect(result.exitCode, result.stderr).toBe(0);
 	expect(await spawnedArguments(directory)).toEqual([
-		["serve", "--trust-workspace", "--contributor-mode", "off"],
-		["serve", "--trust-workspace", "--contributor-mode", "on"],
+		["serve", "--trust-workspace", "--contributor-mode", "off", "-c", 'run.subagent_delegation_mode="auto"'],
+		["serve", "--trust-workspace", "--contributor-mode", "on", "-c", 'run.subagent_delegation_mode="auto"'],
 	]);
 }));
 
@@ -59,8 +59,8 @@ test("standard and contributor turns run simultaneously on separate hosts", () =
 	`, environment(directory, data, executable));
 	expect(result.exitCode, result.stderr).toBe(0);
 	expect((await spawnedArguments(directory)).map((args) => args.join(" ")).sort()).toEqual([
-		"serve --disable-sandbox --trust-workspace --contributor-mode off",
-		"serve --disable-sandbox --trust-workspace --contributor-mode on",
+		"serve --disable-sandbox --trust-workspace --contributor-mode off -c run.subagent_delegation_mode=\"auto\"",
+		"serve --disable-sandbox --trust-workspace --contributor-mode on -c run.subagent_delegation_mode=\"auto\"",
 	]);
 }));
 
@@ -74,7 +74,7 @@ test("the model catalog probe runs on a standard-mode host", () => temporary(asy
 		} finally { shutdownHost(); }
 	`, environment(directory, data, executable));
 	expect(result.exitCode, result.stderr).toBe(0);
-	expect(await spawnedArguments(directory)).toEqual([["serve", "--trust-workspace", "--contributor-mode", "off"]]);
+	expect(await spawnedArguments(directory)).toEqual([["serve", "--trust-workspace", "--contributor-mode", "off", "-c", 'run.subagent_delegation_mode="auto"']]);
 }));
 
 test("a session cannot switch contributor modes and no host is spawned for the rejected turn", () => temporary(async (directory) => {
@@ -88,5 +88,5 @@ test("a session cannot switch contributor modes and no host is spawned for the r
 		} finally { shutdownHost(); }
 	`, environment(directory, data, executable));
 	expect(result.exitCode, result.stderr).toBe(0);
-	expect(await spawnedArguments(directory)).toEqual([["serve", "--trust-workspace", "--contributor-mode", "off"]]);
+	expect(await spawnedArguments(directory)).toEqual([["serve", "--trust-workspace", "--contributor-mode", "off", "-c", 'run.subagent_delegation_mode="auto"']]);
 }));

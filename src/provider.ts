@@ -4,7 +4,7 @@ import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { getMuseCatalog, hasLiveMuseCatalog, setLiveMuseCatalog, type MuseCatalog, type MuseCatalogModel } from "./catalog.ts";
 import { runMuse } from "./runtime.ts";
-import { HostUnavailableError, listMuseCatalog, type MuseTodoEntry, MuseSessionUnusableError, runMuseTurn, shutdownHost, steerActiveMuseRuns, uuidv7 } from "./msp.ts";
+import { buildOmpTaskArgs, HostUnavailableError, listMuseCatalog, type MuseTodoEntry, MuseSessionUnusableError, runMuseTurn, shutdownHost, steerActiveMuseRuns, uuidv7 } from "./msp.ts";
 import { contextCheckpoint, prepareMuseContext, type MusePromptContext } from "./context.ts";
 import { registerMusePlanDisplay } from "./plan.ts";
 import { readMuseSession, writeMuseSession, type StoredMuseSession } from "./session-store.ts";
@@ -14,6 +14,26 @@ import { museUsageProvider } from "./usage.ts";
 const MUSE_API = "muse-code-cli" as Api;
 const ALIAS_ID = "muse-spark";
 
+/**
+ * Meta Model API list prices ($/1M tokens) applied when the catalog row has no
+ * cost (`cost: null` → all-zero). Sources: Meta developer pricing page via
+ * TechCrunch/betanews (wonder $4/$20/$0.20), Meta list prices via orcarouter
+ * (spark $1.25/$4.25/$0.15) and codersera (spark-contributor $0.10/$0.20/$0.002).
+ * Wonder-contributor has no published distinct rate, so it inherits wonder.
+ */
+const KNOWN_API_COSTS: Record<string, MuseCatalogModel["cost"]> = {
+	"muse-wonder-1.0": { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 0 },
+	"muse-spark-1.3": { input: 1.25, output: 4.25, cacheRead: 0.15, cacheWrite: 0 },
+	"muse-spark-1.3-contributor": { input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 },
+};
+
+/** Keep live/catalog rates when present; fill all-zero costs from the known API card. */
+function costFor(id: string, model: MuseCatalogModel) {
+	const cost = model.cost;
+	if (cost.input !== 0 || cost.output !== 0 || cost.cacheRead !== 0 || cost.cacheWrite !== 0) return cost;
+	return KNOWN_API_COSTS[id] ?? KNOWN_API_COSTS[model.id] ?? cost;
+}
+
 function modelDefinition(model: MuseCatalogModel, id = model.id, name = model.name) {
 	return {
 		id,
@@ -21,7 +41,7 @@ function modelDefinition(model: MuseCatalogModel, id = model.id, name = model.na
 		reasoning: true,
 		thinkingLevelMap: { off: "off", xhigh: "xhigh", max: "max" },
 		input: ["text"] as Array<"text" | "image">,
-		cost: model.cost,
+		cost: costFor(id, model),
 		contextWindow: model.contextWindow,
 		maxTokens: model.maxTokens,
 	};
@@ -35,7 +55,7 @@ function museProviderModels(catalog: MuseCatalog) {
 			.map((model) => modelDefinition(model))];
 	return models.flatMap((model) => [
 		model,
-		{ ...model, id: `${model.id}-contributor`, name: `${model.name} (contributor)` },
+		{ ...model, id: `${model.id}-contributor`, name: `${model.name} (contributor)`, cost: KNOWN_API_COSTS[`${model.id}-contributor`] ?? model.cost },
 	]);
 }
 
@@ -63,6 +83,8 @@ interface MuseProviderSessionState extends Omit<StoredMuseSession, "updatedAt"> 
 	busy: boolean;
 	closed: boolean;
 	close(): void;
+	/** Held across an OMP tool loop after a delegate takeover: re-entry starts one fresh host turn. */
+	awaitingOmpResult?: boolean;
 }
 
 export interface MuseStreamSettings {
@@ -100,7 +122,20 @@ async function museSessionState(
 		options.providerSessionState.delete(MUSE_API);
 		state = undefined;
 	}
-	if (state?.busy) throw new Error("This OMP session already has an active Muse request");
+	if (state?.busy) {
+		// OMP tool loop after a delegate takeover: attach for one fresh host turn carrying the task result.
+		if (state.awaitingOmpResult) {
+			state.awaitingOmpResult = false;
+			state.sessionId = uuidv7();
+			state.initialized = false;
+			state.contributor = contributor;
+			state.systemPrompt = prepared.systemPrompt;
+			state.checkpoint = undefined;
+			await persistSession(state, diagnostic);
+			return state;
+		}
+		throw new Error("This OMP session already has an active Muse request");
+	}
 	if (!state) {
 		state = {
 			ompSessionId: options.sessionId,
@@ -274,6 +309,9 @@ export function streamMuse(
 			output.usage.cacheWrite = usage.cacheWrite;
 			output.usage.totalTokens = usage.totalTokens;
 			calculateCost(model, output.usage);
+			if (Number.isFinite(usage.cost) && usage.cost > 0) {
+				output.usage.cost.total = usage.cost;
+			}
 			if (usage.contextTokens !== undefined) {
 				output.contextSnapshot = { promptTokens: usage.contextTokens, nonMessageTokens: 0 };
 			}
@@ -340,6 +378,25 @@ export function streamMuse(
 					for (const message of outcome.diagnostics) diagnostic?.(message);
 					reconcileFinalText(outcome.output || (outcome.errorMessage ? "" : "(no output from Muse)"));
 					setUsage(outcome.usage);
+					if (outcome.delegateRedirect) {
+						closeOpenBlock();
+						recordDuration();
+						const taskIndex = output.content.length;
+						const taskCall = { type: "toolCall" as const, id: uuidv7(), name: "task", arguments: buildOmpTaskArgs(outcome.delegateRedirect) };
+						output.content.push(taskCall);
+						output.stopReason = "toolUse";
+						stream.push({ type: "toolcall_start", contentIndex: taskIndex, partial: output });
+						stream.push({ type: "toolcall_end", contentIndex: taskIndex, toolCall: taskCall, partial: output });
+						// Hold the OMP session across the tool loop; re-entry starts one fresh host turn.
+						sessionState.sessionId = uuidv7();
+						sessionState.initialized = false;
+						sessionState.awaitingOmpResult = true;
+						await persistSession(sessionState, diagnostic);
+						sessionState = undefined;
+						stream.push({ type: "done", reason: "toolUse", message: output });
+						stream.end();
+						return;
+					}
 					if (outcome.errorMessage) {
 						if (outcome.aborted) output.stopReason = "aborted";
 						throw new Error(outcome.errorMessage);

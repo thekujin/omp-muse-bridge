@@ -45,6 +45,23 @@ const EMPTY_USAGE: MuseUsage = {
 
 export { museThinkingLevel };
 
+// Muse acts as a prompt layer only: OMP owns tools and subagents. web_search is the one inert tool Muse cannot drop.
+// `--disable-reminders` is exec-only (`muse serve` rejects it); serve relies on the bridge hiding reminder items.
+export const MUSE_HARNESS_OFF_ARGS = ["-c", 'run.subagent_delegation_mode="off"', "-c", 'run.toolset=["web_search"]'];
+
+/** OMP-side execution of Muse delegate turns: native subagents spawn, but each child tool call is taken over by OMP. */
+export function delegateRedirectEnabled(env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env): boolean {
+	const raw = (env.PI_MUSE_DELEGATE_VIA_OMP ?? "").trim().toLowerCase();
+	if (raw === "") return true;
+	return !/^(0|false|no|off)$/.test(raw);
+}
+
+/** Host args for the current posture: redirect drops the prompt-layer locks so native spawns can surface. */
+export function museHarnessArgs(env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env): string[] {
+	if (delegateRedirectEnabled(env)) return ["-c", 'run.subagent_delegation_mode="auto"'];
+	return MUSE_HARNESS_OFF_ARGS;
+}
+
 export function getMuseExecArgs(
 	promptFile: string,
 	workspace: string,
@@ -54,7 +71,7 @@ export function getMuseExecArgs(
 	sessionId?: string,
 	contributor = false,
 ): string[] {
-	const args = ["exec", "--json", "--prompt-file", promptFile, "--workspace", workspace, "--user-input-auto-resolve", "--contributor-mode", contributor ? "on" : "off"];
+	const args = ["exec", "--json", "--prompt-file", promptFile, "--workspace", workspace, "--user-input-auto-resolve", "--contributor-mode", contributor ? "on" : "off", ...museHarnessArgs(), "--disable-reminders"];
 	if (sessionId) args.push("--session-id", sessionId);
 	if (yolo) args.push("--yolo");
 	else args.push("--trust-workspace", "--disable-approval");

@@ -258,3 +258,42 @@ test("usage falls back to raw counters when the counted-once derivations are abs
 	clampedRun.settle();
 	run.settle();
 });
+
+test("backend-reported cost accumulates across completions and absence stays zero", async () => {
+	const host = fakeHost();
+	const run = new TurnRun({ host, sessionId: "session-1" });
+	run.turnId = "turn-1";
+
+	run.handleNotification("session/tokenUsage", {
+		sessionId: "session-1",
+		viewCursor: "c1",
+		turnId: "turn-1",
+		promptTokens: 100,
+		totalTokens: 140,
+		usage: { inputTokens: 90, outputTokens: 40, cachedTokens: 60, cost: 0.25 },
+	});
+	run.handleNotification("session/tokenUsage", {
+		sessionId: "session-1",
+		viewCursor: "c2",
+		turnId: "turn-1",
+		promptTokens: 100,
+		totalTokens: 170,
+		usage: { inputTokens: 95, outputTokens: 70, cachedTokens: 60, cost_total: 0.5 },
+	});
+	run.handleNotification("turn/completed", durableTerminal("turn-1", "c3"));
+	await run.terminal;
+
+	expect(run.tokenUsage?.cost).toBe(0.75);
+	run.settle();
+
+	const absent = new TurnRun({ host, sessionId: "session-1" });
+	absent.turnId = "turn-1";
+	absent.handleNotification("session/tokenUsage", {
+		sessionId: "session-1",
+		viewCursor: "c1",
+		turnId: "turn-1",
+		usage: { inputTokens: 50, outputTokens: 20 },
+	});
+	expect(absent.tokenUsage?.cost).toBe(0);
+	absent.settle();
+});

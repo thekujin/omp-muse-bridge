@@ -14,6 +14,7 @@ const toolItem = (id: string, tool: string, args: string, status: string): Frame
 test("a run parked in the successor hold refuses to steer", async () => {
 	const run = new TurnRun({ host: acceptingHost(), sessionId: "session-1" });
 	run.turnId = "turn-1";
+	run.turnSubmitted = true;
 
 	// First steer lands while the turn is live.
 	expect(await run.steer([{ type: "text", text: "first" }])).toBe(true);
@@ -29,6 +30,7 @@ test("a run parked in the successor hold refuses to steer", async () => {
 test("an interrupted run refuses to steer even before it settles", async () => {
 	const run = new TurnRun({ host: acceptingHost(), sessionId: "session-1" });
 	run.turnId = "turn-1";
+	run.turnSubmitted = true;
 	run.markInterrupted();
 	expect(await run.steer([{ type: "text", text: "after escape" }])).toBe(false);
 	run.settle();
@@ -37,6 +39,7 @@ test("an interrupted run refuses to steer even before it settles", async () => {
 test("a steered userMessage clears the hold so the next terminal resolves immediately", async () => {
 	const run = new TurnRun({ host: acceptingHost(), sessionId: "session-1" });
 	run.turnId = "turn-1";
+	run.turnSubmitted = true;
 	expect(await run.steer([{ type: "text", text: "redirect" }])).toBe(true);
 
 	run.handleNotification("item/completed", {
@@ -54,6 +57,7 @@ test("a userMessage consumed before the steer continuation cannot rearm its hold
 	const ack = Promise.withResolvers<Frame>();
 	const run = new TurnRun({ host: { request: () => ack.promise }, sessionId: "session-1" });
 	run.turnId = "turn-1";
+	run.turnSubmitted = true;
 	try {
 		const steering = run.steer([{ type: "text", text: "redirect" }]);
 		ack.resolve({});
@@ -76,6 +80,7 @@ test("an acknowledgement batched with the parent terminal preserves the successo
 	const ack = Promise.withResolvers<Frame>();
 	const run = new TurnRun({ host: { request: () => ack.promise }, sessionId: "session-1" });
 	run.turnId = "turn-1";
+	run.turnSubmitted = true;
 	try {
 		const steering = run.steer([{ type: "text", text: "redirect" }]);
 		ack.resolve({});
@@ -108,6 +113,7 @@ test("a rejected steer releases no hold the next terminal must outwait", async (
 	const rejectingHost: MuseRequester = { request: (): Promise<Frame> => Promise.reject(new Error("command rejected")) };
 	const run = new TurnRun({ host: rejectingHost, sessionId: "session-1" });
 	run.turnId = "turn-1";
+	run.turnSubmitted = true;
 
 	expect(await run.steer([{ type: "text", text: "redirect" }])).toBe(false);
 	run.handleNotification("turn/completed", { sessionId: "session-1", turnId: "turn-1", terminal: "completed" });
@@ -121,6 +127,7 @@ test("tool activity names the tool and its target, and reports no raw output", (
 	const activity: string[] = [];
 	const run = new TurnRun({ host: acceptingHost(), sessionId: "session-1", onActivityDelta: (delta) => activity.push(delta.trim()) });
 	run.turnId = "turn-1";
+	run.turnSubmitted = true;
 
 	run.handleNotification("item/started", toolItem("t1", "edit_file", JSON.stringify({ path: "src/models.py" }), "inProgress"));
 	run.handleNotification("item/completed", {
@@ -139,6 +146,7 @@ test("change stats surface exact bounded statistics only, never the surrounding 
 	const activity: string[] = [];
 	const run = new TurnRun({ host: acceptingHost(), sessionId: "session-1", onActivityDelta: (delta) => activity.push(delta.trim()) });
 	run.turnId = "turn-1";
+	run.turnSubmitted = true;
 
 	run.handleNotification("item/started", toolItem("t2", "edit_file", JSON.stringify({ path: "src/msp.ts" }), "inProgress"));
 	run.handleNotification("item/completed", {
@@ -166,6 +174,7 @@ test("a statistic-shaped prefix cannot expose arbitrary multiline tool output", 
 	const activity: string[] = [];
 	const run = new TurnRun({ host: acceptingHost(), sessionId: "session-1", onActivityDelta: (delta) => activity.push(delta) });
 	run.turnId = "turn-1";
+	run.turnSubmitted = true;
 	try {
 		run.handleNotification("item/completed", {
 			sessionId: "session-1",
@@ -192,6 +201,7 @@ test("todo tool calls are hidden; the canonical session snapshot drives the plan
 		onTodoSnapshot: (entries) => snapshots.push(entries),
 	});
 	run.turnId = "turn-1";
+	run.turnSubmitted = true;
 
 	// Proposed args at tool start are not a snapshot: neither an activity line nor a callback.
 	run.handleNotification("item/started", toolItem("t3", "write_todos", JSON.stringify({
@@ -224,6 +234,7 @@ test("web sources report one label-shaped host per site, whatever punctuation tr
 	const activity: string[] = [];
 	const run = new TurnRun({ host: acceptingHost(), sessionId: "session-1", onActivityDelta: (delta) => activity.push(delta.trim()) });
 	run.turnId = "turn-1";
+	run.turnSubmitted = true;
 
 	run.handleNotification("item/completed", {
 		sessionId: "session-1",
@@ -253,6 +264,7 @@ test("activity carries no provider label and hides Muse-internal orchestration",
 	const activity: string[] = [];
 	const run = new TurnRun({ host: acceptingHost(), sessionId: "session-1", onActivityDelta: (delta) => activity.push(delta.trim()) });
 	run.turnId = "turn-1";
+	run.turnSubmitted = true;
 
 	run.handleNotification("item/started", toolItem("t0", "bash", JSON.stringify({ command: "git diff --stat", description: "Review change scope" }), "inProgress"));
 	for (const entry of [
@@ -281,6 +293,7 @@ test("failure results report the failure reason, never the raw output", () => {
 	const activity: string[] = [];
 	const run = new TurnRun({ host: acceptingHost(), sessionId: "session-1", onActivityDelta: (delta) => activity.push(delta.trim()) });
 	run.turnId = "turn-1";
+	run.turnSubmitted = true;
 
 	run.handleNotification("item/started", toolItem("t5", "bash", JSON.stringify({ command: "bun test" }), "inProgress"));
 	run.handleNotification("item/completed", {

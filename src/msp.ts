@@ -3,6 +3,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { errorMessage } from "./utils.ts";
 import { museThinkingLevel, type MuseThinkingLevel, type MuseUsage } from "./contracts.ts";
 import { parseMuseModelSelector, resolveMuseModelId, type MuseCatalog, type MuseCatalogModel } from "./catalog.ts";
+import { delegateRedirectEnabled, museHarnessArgs } from "./runtime.ts";
 
 /** Muse Session Protocol client over newline-delimited JSON-RPC stdio. */
 
@@ -187,6 +188,8 @@ class MuseHost {
 	static async connect(sandboxed: boolean, contributor: boolean): Promise<MuseHost> {
 		const args = sandboxed ? ["serve", "--trust-workspace"] : ["serve", "--disable-sandbox", "--trust-workspace"];
 		args.push("--contributor-mode", contributor ? "on" : "off");
+		// Prompt layer hides native subagents; delegate-takeover lets them spawn so OMP can run them.
+		args.push(...museHarnessArgs());
 		let child: ChildProcess;
 		try {
 			child = spawn(process.env.PI_MUSE_BINARY?.trim() || "muse", args, { stdio: ["pipe", "pipe", "pipe"] });
@@ -339,10 +342,13 @@ interface HostSlot {
 	sandboxed: boolean | undefined;
 	promise: Promise<MuseHost> | null;
 }
-const hostSlots: Record<ContributorMode, HostSlot> = {
-	on: { host: null, sandboxed: undefined, promise: null },
-	off: { host: null, sandboxed: undefined, promise: null },
-};
+const hostSlots: Record<string, HostSlot> = {};
+
+/** Hosts are spawned per posture: a delegate-takeover host never shares a process with a prompt-layer one. */
+function slotFor(mode: ContributorMode): HostSlot {
+	const key = `${mode}:${delegateRedirectEnabled() ? "delegate" : "prompt"}`;
+	return hostSlots[key] ??= { host: null, sandboxed: undefined, promise: null };
+}
 const sessionsOnHost = new Map<string, MuseHost>();
 /** Mode each session was opened in; kept across host restarts so a session never changes modes. */
 const sessionModes = new Map<string, boolean>();
@@ -374,11 +380,83 @@ export interface TurnRunOptions {
 	onActivityDelta?: (delta: string) => void;
 	/** Canonical todo snapshot; replace the whole list, an empty array is a cleared list. */
 	onTodoSnapshot?: (entries: MuseTodoEntry[]) => void;
+	/** Take over native delegations: the first acting child runs as an OMP `task` instead. */
+	delegateViaOmp?: boolean;
 	/**
 	 * Authoritative completed text of one agent item, including durable catch-up recovery. The consumer reconciles
 	 * that item's whole rendered text from it, so a late completion need not preserve corrupted streamed partials.
 	 */
 	onTextSnapshot?: (itemId: string, text: string) => void;
+}
+
+/** A native `subagent_spawn` call whose child started acting: the unit OMP takes over. */
+export interface DelegateSpawn {
+	commandId: string;
+	role: string;
+	objective: string;
+	subagentId?: string;
+}
+
+/** OMP-side handoff for one native delegation: run the objective as an OMP `task`. */
+export interface DelegateRedirect {
+	objective: string;
+	role: string;
+	subagentId?: string;
+}
+
+/** Parse a native `subagent_spawn` tool call; undefined when it carries no objective. */
+export function parseSubagentSpawnArgs(args: string): { commandId: string; role: string; objective: string } | undefined {
+	let record: Frame | undefined;
+	try {
+		record = asRecord(JSON.parse(args));
+	} catch {
+		return undefined;
+	}
+	const objective = record ? text(record.objective) : "";
+	if (!objective) return undefined;
+	return { commandId: text(record?.command_id), role: text(record?.role), objective };
+}
+
+/** The native child id from a spawn result, for `subagent/stop`; undefined when absent. */
+export function parseSubagentSpawnResult(output: string): string | undefined {
+	try {
+		const id = text(asRecord(JSON.parse(output))?.subagent_id);
+		return id || undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** OMP `task` arguments for a redirected spawn: the objective travels as `task`. */
+export function buildOmpTaskArgs(spawn: { objective: string }): { task: string } {
+	return { task: spawn.objective };
+}
+
+/** First choice matching one of `decisions` in order, preferring once-scoped; undefined when absent. */
+export function pickDecisionChoice(choices: unknown, decisions: readonly string[]): { choiceId: string; decision: string } | undefined {
+	if (!Array.isArray(choices)) return undefined;
+	for (const wanted of decisions) {
+		const matching = choices.filter((entry) => {
+			const record = asRecord(entry);
+			return !!record && String(record.decision).toLowerCase() === wanted;
+		});
+		const scoped = matching.find((entry) => String(asRecord(entry)?.scope).toLowerCase() === "once") ?? matching[0];
+		const record = scoped ? asRecord(scoped) : undefined;
+		const choiceId = record ? text(record.choiceId) : "";
+		if (choiceId) return { choiceId, decision: wanted };
+	}
+	return undefined;
+}
+
+/** A `denied` approval choice, preferring once-scoped; undefined when denial is not offered. */
+export function pickDenyChoice(choices: unknown): { choiceId: string } | undefined {
+	const picked = pickDecisionChoice(choices, ["denied"]);
+	return picked ? { choiceId: picked.choiceId } : undefined;
+}
+
+/** A child-turn approval is foreign to the parent turn the bridge owns. */
+export function isChildApproval(approvalTurnId: string, parentTurnId: string | undefined): boolean {
+	return !!approvalTurnId && !!parentTurnId && approvalTurnId !== parentTurnId;
 }
 
 export class TurnRun {
@@ -387,6 +465,14 @@ export class TurnRun {
 	turnId: string | undefined;
 	private usage: MuseUsage | undefined;
 	private interrupted = false;
+	/** Set once `turn/start` is on the wire; an earlier steer would reach the host before the turn exists. */
+	turnSubmitted = false;
+	private readonly delegateViaOmp: boolean;
+	/** OMP handoff for this turn's native delegation; set once, cleared never. */
+	delegateRedirect: DelegateRedirect | undefined;
+	private lastSpawn: DelegateSpawn | undefined;
+	private redirectTaken = false;
+	private readonly seenApprovals = new Set<string>();
 	private terminalResolved = false;
 	private catchUpTask: Promise<void> | undefined;
 	private gapRevision = 0;
@@ -422,6 +508,7 @@ export class TurnRun {
 		this.onActivityDelta = options.onActivityDelta;
 		this.onTodoSnapshot = options.onTodoSnapshot;
 		this.onTextSnapshot = options.onTextSnapshot;
+		this.delegateViaOmp = options.delegateViaOmp === true;
 		this.reasoningEffort = museThinkingLevel(options.thinkingLevel);
 		const { promise, resolve } = Promise.withResolvers<TurnTerminal>();
 		this.terminal = promise;
@@ -556,6 +643,52 @@ export class TurnRun {
 		this.onActivityDelta?.(delta);
 	}
 
+	/**
+	 * Take over acting native children: stopping the child resolves its pending approval on the host
+	 * (observed `decision:"abort"` with no `decide` call), so no choice-picking or per-stage follow-ups.
+	 * The first stop sets the OMP handoff; later children are stopped without changing it.
+	 */
+	private processApproval(params: Frame): void {
+		if (params.sessionId !== undefined && text(params.sessionId) !== this.sessionId) return;
+		const approvalId = text(params.approvalId);
+		if (!approvalId || this.seenApprovals.has(approvalId)) return;
+		this.seenApprovals.add(approvalId);
+		if (!this.delegateViaOmp) return;
+		if (!isChildApproval(text(params.turnId), this.turnId)) return;
+		const spawn = this.lastSpawn;
+		if (!spawn?.subagentId) {
+			this.resolveApprovalNatively(params, approvalId);
+			return;
+		}
+		if (!this.redirectTaken) {
+			this.redirectTaken = true;
+			this.delegateRedirect = { objective: spawn.objective, role: spawn.role, subagentId: spawn.subagentId };
+		}
+		this.host.request("subagent/stop", {
+			commandId: uuidv7(), sessionId: this.sessionId, subagentId: spawn.subagentId,
+			reason: "omp-muse-bridge: delegate turn executes via OMP",
+		}, 10_000).catch((error: unknown) => this.diagnostics.push(`Muse subagent stop was not acknowledged: ${errorMessage(error)}`));
+		if (!this.interrupted) this.markInterrupted();
+	}
+
+	/**
+	 * No safe takeover (the child cannot be stopped without double execution): resolve the approval
+	 * natively, preferring abort/deny over silent approval, and leave the turn running as before.
+	 */
+	private resolveApprovalNatively(params: Frame, approvalId: string): void {
+		const picked = pickDecisionChoice(params.availableChoices, ["denied", "abort", "approved"]);
+		const requirementId = asRecord(params.currentRequirementId);
+		if (!picked || !requirementId) {
+			this.diagnostics.push("Muse delegate turn kept native execution (its approval is undecidable here)");
+			return;
+		}
+		this.diagnostics.push(`Muse delegate turn kept native execution (${picked.decision})`);
+		this.host.request("approval/decide", {
+			commandId: uuidv7(), sessionId: this.sessionId,
+			approvalId, choiceId: picked.choiceId, requirementId,
+		}, 10_000).catch((error: unknown) => this.diagnostics.push(`Muse approval decision was not acknowledged: ${errorMessage(error)}`));
+	}
+
 	private process(method: string, params: Frame): void {
 		if (this.settledFlag) return;
 		if (method === "view/gap") {
@@ -599,6 +732,10 @@ export class TurnRun {
 			tracked.kind = kind;
 			tracked.turnId = ownerTurnId;
 			this.items.set(itemId, tracked);
+			if (method === "item/completed" && kind === "toolCall" && text(item.tool) === "subagent_spawn") {
+				const spawn = parseSubagentSpawnArgs(text(item.args));
+				if (spawn) this.lastSpawn = { ...spawn, subagentId: parseSubagentSpawnResult(text(item.visibleOutput)) };
+			}
 			if (method === "item/completed" && kind === "agentMessage" && typeof item.text === "string") {
 				tracked.finalText = item.text;
 				this.onTextSnapshot?.(itemId, item.text);
@@ -623,6 +760,10 @@ export class TurnRun {
 			}
 			// Tool/shell `output` deltas are deliberately not surfaced: the lifecycle labels from emitItemProgress
 			// carry the signal, and raw tool output (e.g. a full directory listing) floods the transcript.
+			return;
+		}
+		if (method === "approval/request" || method === "approval/requested") {
+			this.processApproval(params);
 			return;
 		}
 		if (method === "session/todoListChanged") {
@@ -652,6 +793,8 @@ export class TurnRun {
 			this.usage ??= { ...EMPTY_USAGE };
 			const cacheReadTokens = numeric(frame?.cacheReadTokens ?? frame?.cachedTokens);
 			const cacheWriteTokens = numeric(frame?.cacheWriteTokens);
+			const reportedCost = frame?.cost ?? frame?.cost_total;
+			const costDelta = typeof reportedCost === "number" && Number.isFinite(reportedCost) && reportedCost > 0 ? reportedCost : 0;
 			const rawInput = numeric(frame?.inputTokens);
 			const promptTokens = prompt ?? rawInput + cacheReadTokens + cacheWriteTokens;
 			const output = numeric(frame?.outputTokens);
@@ -660,6 +803,7 @@ export class TurnRun {
 			this.usage.cacheRead += cacheReadTokens;
 			this.usage.cacheWrite += cacheWriteTokens;
 			this.usage.totalTokens += total ?? promptTokens + output;
+			this.usage.cost += costDelta;
 			this.usage.turns += 1;
 			return;
 		}
@@ -772,7 +916,7 @@ export class TurnRun {
 
 	/** Steering is valid only while this run owns a live, uninterrupted turn. */
 	private get steerable(): boolean {
-		return !this.settledFlag && !this.terminalResolved && !this.interrupted && !this.heldTerminal && this.turnId !== undefined;
+		return !this.settledFlag && !this.terminalResolved && !this.interrupted && !this.heldTerminal && this.turnSubmitted && this.turnId !== undefined;
 	}
 
 	private get hasUnansweredSteer(): boolean {
@@ -871,7 +1015,7 @@ function hostListener(method: string, params: Frame): void {
 
 /** Forget a slot's host and the sessions bound to it; the caller disposes the returned host. */
 function resetHostSlot(mode: ContributorMode): MuseHost | null {
-	const slot = hostSlots[mode];
+	const slot = slotFor(mode);
 	const host = slot.host;
 	slot.host = null;
 	slot.sandboxed = undefined;
@@ -887,7 +1031,7 @@ function resetHostSlot(mode: ContributorMode): MuseHost | null {
 
 export async function ensureHost(sandboxed: boolean, contributor: boolean): Promise<MuseHost> {
 	const mode: ContributorMode = contributor ? "on" : "off";
-	const slot = hostSlots[mode];
+	const slot = slotFor(mode);
 	if (slot.host && !slot.host.dead && slot.sandboxed === sandboxed) return slot.host;
 	if (slot.host && !slot.host.dead && slot.sandboxed !== sandboxed) {
 		if (activeRuns.size) throw new Error("Cannot change Muse sandbox posture while a host turn is active");
@@ -913,7 +1057,20 @@ export async function ensureHost(sandboxed: boolean, contributor: boolean): Prom
 }
 
 export function shutdownHost(): void {
-	const hosts = [resetHostSlot("on"), resetHostSlot("off")];
+	const hosts: Array<MuseHost | null> = [];
+	for (const slot of Object.values(hostSlots)) {
+		const host = slot.host;
+		slot.host = null;
+		slot.sandboxed = undefined;
+		slot.promise = null;
+		if (host) {
+			for (const [key, value] of [...sessionsOnHost]) if (value === host) {
+				sessionsOnHost.delete(key);
+				sessionModelOnHost.delete(key);
+			}
+		}
+		hosts.push(host);
+	}
 	sessionsOnHost.clear();
 	sessionModelOnHost.clear();
 	sessionModes.clear();
@@ -981,6 +1138,8 @@ export interface MuseTurnOutcome {
 	aborted?: boolean;
 	/** Set with `aborted` when a host terminal confirmed the cancellation (never when the run settled locally). */
 	backendInterrupted?: boolean;
+	/** Set when a native delegation was taken over: run `objective` as an OMP `task` instead. */
+	delegateRedirect?: DelegateRedirect;
 }
 
 const EMPTY_USAGE: MuseUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0, turns: 0 };
@@ -1029,6 +1188,7 @@ export async function runMuseTurn(args: MuseTurnArgs): Promise<MuseTurnOutcome> 
 		onTextDelta: args.onTextDelta, onTextSnapshot: args.onTextSnapshot,
 		onReasoningDelta: args.onReasoningDelta, onActivityDelta: args.onActivityDelta,
 		onTodoSnapshot: args.onTodoSnapshot,
+		delegateViaOmp: delegateRedirectEnabled(),
 	});
 	const turnCommand = uuidv7();
 	run.turnId = turnCommand;
@@ -1086,6 +1246,7 @@ export async function runMuseTurn(args: MuseTurnArgs): Promise<MuseTurnOutcome> 
 		args.signal?.addEventListener("abort", abortHandler, { once: true });
 		const firstInput = createdSession ? args.initialPrompt?.() ?? args.prompt : args.prompt;
 		turnStartSent = true;
+		run.turnSubmitted = true;
 		const ack = await request("turn/start", {
 			commandId: turnCommand, sessionId: args.sessionId,
 			input: [{ type: "text", text: firstInput }],
@@ -1100,6 +1261,9 @@ export async function runMuseTurn(args: MuseTurnArgs): Promise<MuseTurnOutcome> 
 		const usage = { ...(run.tokenUsage ?? EMPTY_USAGE) };
 		if (!usage.turns) usage.turns = 1;
 		const backendInterrupted = !terminal.localAbort && terminal.terminal === "cancelled";
+		if (run.delegateRedirect && !args.signal?.aborted) {
+			return { output: run.finalText, usage, diagnostics: run.diagnostics, delegateRedirect: run.delegateRedirect };
+		}
 		if (args.signal?.aborted || terminal.interrupted || terminal.terminal === "cancelled") {
 			return {
 				output: run.finalText, usage, diagnostics: run.diagnostics, aborted: true, backendInterrupted,

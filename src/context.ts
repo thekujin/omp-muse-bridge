@@ -4,6 +4,8 @@ import { loadMuseSystemPrompt } from "./runtime.ts";
 
 const INITIAL_CONTEXT_CHARS = 40_000;
 const TOOL_DETAIL_CHARS = 400;
+/** Tool results are payloads (an OMP `task` result feeds the next turn); keep them past the arg-clip. */
+const TOOL_RESULT_CHARS = 4000;
 const COMPACTION_MARKER = "Prior model work/tool state available.";
 
 const BRIDGE_DIRECTIVE = [
@@ -83,7 +85,7 @@ function renderSeedMessage(message: Message): string {
 		return parts ? `assistant: ${parts}` : "";
 	}
 	if (message.role === "toolResult") {
-		const body = clip(textParts(message.content), TOOL_DETAIL_CHARS);
+		const body = clip(textParts(message.content), TOOL_RESULT_CHARS);
 		return body ? `tool_result(${message.toolName}${message.isError ? ", error" : ""}): ${body}` : "";
 	}
 	const body = textParts(message.content);

@@ -53,6 +53,8 @@ test("exec routes contributor and standard selectors to the matching Muse mode",
 		assert.equal(argsSeen[argsSeen.indexOf("--model") + 1], "muse-test");
 		await runMuse(request);
 		assert.equal(argsSeen[argsSeen.indexOf("--contributor-mode") + 1], "off");
+		assert.equal(argsSeen[argsSeen.indexOf("-c") + 1], 'run.subagent_delegation_mode="auto"');
+		assert.ok(!argsSeen.includes('run.toolset=["web_search"]') && argsSeen.includes("--disable-reminders"));
 	`, { TEST_DIR: directory, XDG_DATA_HOME: data });
 	expect(result.exitCode, result.stderr).toBe(0);
 }));
