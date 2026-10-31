@@ -7,6 +7,7 @@ import {
 	parseSubagentSpawnArgs,
 	parseSubagentSpawnResult,
 	pickDenyChoice,
+	sameDelegateObjective,
 	TurnRun,
 	type Frame,
 	type MuseRequester,
@@ -196,6 +197,125 @@ try {
 	`, { TEST_DIR: directory, XDG_DATA_HOME: data, PI_MUSE_BINARY: executable, PI_MUSE_DELEGATE_VIA_OMP: "1" });
 	expect(result.exitCode, result.stderr).toBe(0);
 }));
+
+test("cancelled-task retry keeps the delegation in flight, never a second task", () => temporary(async (directory) => {
+	const data = await testCatalog(directory);
+	const executable = await fakeMuse(directory, `
+		let turns = 0;
+		function onRequest(request) {
+			if (request.method === "turn/interrupt") {
+				reply(request, {turnId: request.params.turnId});
+				notify("turn/completed", {sessionId: request.params.sessionId, turnId: request.params.turnId, terminal: "cancelled"});
+				return true;
+			}
+			if (request.method !== "turn/start") return false;
+			const params = request.params;
+			turns++;
+			reply(request, {turnId: params.commandId});
+			notify("item/completed", {sessionId: params.sessionId, item: {itemId: "spawn-" + turns, kind: "toolCall", turnId: params.commandId, status: "completed", tool: "subagent_spawn", callId: "call_" + turns,
+				args: JSON.stringify({command_id: "c" + turns, role: "general-purpose", objective: "OBJECTIVE_TEXT"}),
+				visibleOutput: JSON.stringify({status: "accepted", subagent_id: "subagent-" + turns})}});
+			notify("approval/requested", {sessionId: params.sessionId, approvalId: "a" + turns, turnId: "child-turn-" + turns, itemId: "i" + turns, toolName: "bash", rawArgs: "{}",
+				currentRequirementId: {approvalId: "a" + turns, sourceIndex: 0},
+				availableChoices: [{choiceId: "allow", decision: "approved", label: "A", scope: "once"}, {choiceId: "deny", decision: "denied", label: "D", scope: "once"}]});
+			return true;
+		}
+	`);
+	const result = await isolated(`
+import assert from "node:assert/strict";
+import {setAgentDir} from "@oh-my-pi/pi-utils";
+import {streamMuse} from "./src/provider.ts";
+import {shutdownHost} from "./src/msp.ts";
+setAgentDir(process.env.TEST_DIR);
+const model = {id: "muse-test", name: "Muse test", reasoning: true, input: ["text"], cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}, contextWindow: 100000, maxTokens: 10000, api: "muse-code-cli", provider: "muse-bridge", baseUrl: "http://localhost"};
+const user = text => ({role: "user", content: text, timestamp: 0});
+const invoke = (messages, state) => streamMuse(model, {systemPrompt: ["# Role\\nSEED_SYSTEM"], messages}, {sessionId: "omp-delegate-retry", providerSessionState: state}, {workspace: process.env.TEST_DIR}).result();
+const state = new Map();
+const messages = [user("DELEGATE_ME")];
+try {
+	const first = await invoke(messages, state);
+	assert.equal(first.stopReason, "toolUse", first.errorMessage);
+	const call = first.content.find(part => part.type === "toolCall");
+	assert.equal(call?.name, "task");
+	messages.push(first, {role: "toolResult", content: "cancelled by user", toolName: "task", toolCallId: call.id, isError: true, timestamp: 0});
+	const second = await invoke(messages, state);
+	assert.equal(second.stopReason, "stop", second.errorMessage);
+	assert.equal(second.content.some(part => part.type === "toolCall"), false);
+	const pending = state.get("muse-code-cli")?.pendingDelegate;
+	assert.equal(pending?.objective, "OBJECTIVE_TEXT");
+} finally { shutdownHost(); }
+`, { TEST_DIR: directory, XDG_DATA_HOME: data, PI_MUSE_BINARY: executable, PI_MUSE_DELEGATE_VIA_OMP: "1" });
+	expect(result.exitCode, result.stderr).toBe(0);
+}));
+
+test("same-turn respawn of one objective stops twice but emits one task", async () => {
+	const { requests, host } = recordingHost();
+	const run = new TurnRun({ host, sessionId: "session-1", delegateViaOmp: true });
+	run.turnId = "parent-turn";
+	run.turnSubmitted = true;
+	run.handleNotification("item/completed", spawnItem());
+	run.handleNotification("approval/requested", childApproval());
+	const retry = spawnItem();
+	(retry.item as Frame).itemId = "spawn-2";
+	(retry.item as Frame).visibleOutput = JSON.stringify({ status: "accepted", subagent_id: "subagent-2" });
+	const retryApproval = childApproval();
+	(retryApproval as Frame).approvalId = "a2";
+	(retryApproval as Frame).turnId = "child-turn-2";
+	(retryApproval as Frame).currentRequirementId = { approvalId: "a2", sourceIndex: 0 };
+	run.handleNotification("item/completed", retry);
+	run.handleNotification("approval/requested", retryApproval);
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(requests.filter((request) => request.method === "subagent/stop")).toHaveLength(2);
+	expect(run.delegateRedirect?.objective).toBe("do the thing");
+	expect(run.duplicateSuppressed).toBe(true);
+	run.settle();
+});
+
+test("respawn matching the in-flight OMP task is stopped without a new handoff", async () => {
+	const { requests, host } = recordingHost();
+	const run = new TurnRun({ host, sessionId: "session-1", delegateViaOmp: true, activeDelegateObjective: "do the thing" });
+	run.turnId = "parent-turn";
+	run.turnSubmitted = true;
+	run.handleNotification("item/completed", spawnItem());
+	run.handleNotification("approval/requested", childApproval());
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	const methods = requests.map((request) => request.method);
+	expect(methods).toContain("subagent/stop");
+	expect(methods).toContain("turn/interrupt");
+	expect(methods).not.toContain("approval/decide");
+	expect(run.delegateRedirect).toBeUndefined();
+	expect(run.duplicateSuppressed).toBe(true);
+	run.settle();
+});
+
+test("reworded retry while a delegate is in flight is stopped without a new handoff", async () => {
+	const { requests, host } = recordingHost();
+	const run = new TurnRun({ host, sessionId: "session-1", delegateViaOmp: true, activeDelegateObjective: "do the thing" });
+	run.turnId = "parent-turn";
+	run.turnSubmitted = true;
+	const retry = spawnItem();
+	(retry.item as Frame).args = JSON.stringify({ command_id: "c1", role: "general-purpose", objective: "do the thing, retrying after cancellation" });
+	run.handleNotification("item/completed", retry);
+	run.handleNotification("approval/requested", childApproval());
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(requests.filter((request) => request.method === "subagent/stop")).toHaveLength(1);
+	expect(run.delegateRedirect).toBeUndefined();
+	expect(run.duplicateSuppressed).toBe(true);
+	run.settle();
+});
+
+test("objective match ignores whitespace; errored task results carry the no-respawn guard", () => {
+	expect(sameDelegateObjective("do  the thing\n", "do the thing")).toBe(true);
+	expect(sameDelegateObjective("other work", "do the thing")).toBe(false);
+	expect(sameDelegateObjective("do the thing", undefined)).toBe(false);
+	const seed = prepareMuseContext({
+		messages: [
+			{ role: "user", content: "CURRENT_TASK", timestamp: 0 },
+			{ role: "toolResult", content: "cancelled by user", toolName: "task", toolCallId: "t1", isError: true, timestamp: 0 },
+		],
+	}, "/workspace").task;
+	expect(seed).toContain("Do not respawn the same delegation");
+});
 
 test("omp delegation sections survive the tool-doc strip", () => {
 	const seed = prepareMuseContext({

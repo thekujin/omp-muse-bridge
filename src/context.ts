@@ -86,7 +86,12 @@ function renderSeedMessage(message: Message): string {
 	}
 	if (message.role === "toolResult") {
 		const body = clip(textParts(message.content), TOOL_RESULT_CHARS);
-		return body ? `tool_result(${message.toolName}${message.isError ? ", error" : ""}): ${body}` : "";
+		if (!body) return "";
+		// A cancelled/failed OMP task may still run underneath: never silently respawn the same delegation.
+		const guard = message.toolName === "task" && message.isError
+			? " Do not respawn the same delegation; report the status and ask the user how to proceed."
+			: "";
+		return `tool_result(${message.toolName}${message.isError ? ", error" : ""}): ${body}${guard}`;
 	}
 	const body = textParts(message.content);
 	return body ? `${message.role}: ${body}` : "";

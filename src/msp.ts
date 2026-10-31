@@ -382,6 +382,8 @@ export interface TurnRunOptions {
 	onTodoSnapshot?: (entries: MuseTodoEntry[]) => void;
 	/** Take over native delegations: the first acting child runs as an OMP `task` instead. */
 	delegateViaOmp?: boolean;
+	/** Objective already running as an OMP `task` from an earlier turn: any respawn is stopped, never re-emitted. */
+	activeDelegateObjective?: string;
 	/**
 	 * Authoritative completed text of one agent item, including durable catch-up recovery. The consumer reconciles
 	 * that item's whole rendered text from it, so a late completion need not preserve corrupted streamed partials.
@@ -459,6 +461,13 @@ export function isChildApproval(approvalTurnId: string, parentTurnId: string | u
 	return !!approvalTurnId && !!parentTurnId && approvalTurnId !== parentTurnId;
 }
 
+/** Same delegation objective: Muse retries the identical text after an interrupt, so whitespace is ignored. */
+export function sameDelegateObjective(a: string, b: string | undefined): boolean {
+	if (!b) return false;
+	const flat = (value: string) => value.replace(/\s+/g, " ").trim();
+	return flat(a).length > 0 && flat(a) === flat(b);
+}
+
 export class TurnRun {
 	/** Items this run streams: kind + owning turnId. Only items owned by `turnId` (or with no owner) are admitted. */
 	private readonly items = new Map<string, TrackedItem>();
@@ -468,8 +477,11 @@ export class TurnRun {
 	/** Set once `turn/start` is on the wire; an earlier steer would reach the host before the turn exists. */
 	turnSubmitted = false;
 	private readonly delegateViaOmp: boolean;
+	private readonly activeDelegateObjective: string | undefined;
 	/** OMP handoff for this turn's native delegation; set once, cleared never. */
 	delegateRedirect: DelegateRedirect | undefined;
+	/** A respawn matching the in-flight OMP task was stopped without emitting a second handoff. */
+	duplicateSuppressed = false;
 	private lastSpawn: DelegateSpawn | undefined;
 	private redirectTaken = false;
 	private readonly seenApprovals = new Set<string>();
@@ -509,6 +521,7 @@ export class TurnRun {
 		this.onTodoSnapshot = options.onTodoSnapshot;
 		this.onTextSnapshot = options.onTextSnapshot;
 		this.delegateViaOmp = options.delegateViaOmp === true;
+		this.activeDelegateObjective = options.activeDelegateObjective?.trim() || undefined;
 		this.reasoningEffort = museThinkingLevel(options.thinkingLevel);
 		const { promise, resolve } = Promise.withResolvers<TurnTerminal>();
 		this.terminal = promise;
@@ -660,9 +673,36 @@ export class TurnRun {
 			this.resolveApprovalNatively(params, approvalId);
 			return;
 		}
+		// Single-flight: one OMP task at a time. A prior turn's task still runs underneath
+		// (even after its cancellation the child keeps acting), so any retry this turn —
+		// identical text or reworded — is a duplicate: stop it, emit nothing.
+		// ponytail: single in-flight delegate; per-objective tracking if parallel delegates matter
+		if (this.activeDelegateObjective) {
+			this.duplicateSuppressed = true;
+			this.diagnostics.push("Muse respawned a delegation already running via OMP; stopped the duplicate without a second task");
+			this.host.request("subagent/stop", {
+				commandId: uuidv7(), sessionId: this.sessionId, subagentId: spawn.subagentId,
+				reason: "omp-muse-bridge: duplicate of the OMP task already running",
+			}, 10_000).catch((error: unknown) => this.diagnostics.push(`Muse subagent stop was not acknowledged: ${errorMessage(error)}`));
+			if (!this.interrupted) this.markInterrupted();
+			return;
+		}
+		// Same-turn single-flight: the first spawn already set the handoff.
+		if (this.redirectTaken && sameDelegateObjective(spawn.objective, this.delegateRedirect?.objective)) {
+			this.duplicateSuppressed = true;
+			this.diagnostics.push("Muse respawned a delegation already running via OMP; stopped the duplicate without a second task");
+			this.host.request("subagent/stop", {
+				commandId: uuidv7(), sessionId: this.sessionId, subagentId: spawn.subagentId,
+				reason: "omp-muse-bridge: duplicate of the OMP task already running",
+			}, 10_000).catch((error: unknown) => this.diagnostics.push(`Muse subagent stop was not acknowledged: ${errorMessage(error)}`));
+			if (!this.interrupted) this.markInterrupted();
+			return;
+		}
 		if (!this.redirectTaken) {
 			this.redirectTaken = true;
 			this.delegateRedirect = { objective: spawn.objective, role: spawn.role, subagentId: spawn.subagentId };
+		} else {
+			this.diagnostics.push("Muse spawned a second delegation while one redirect is already set; stopped it without changing the handoff");
 		}
 		this.host.request("subagent/stop", {
 			commandId: uuidv7(), sessionId: this.sessionId, subagentId: spawn.subagentId,
@@ -1125,6 +1165,8 @@ export interface MuseTurnArgs {
 	 * partials.
 	 */
 	onTextSnapshot?: (itemId: string, text: string) => void;
+	/** Objective already running as an OMP `task`: matching respawns are stopped, never re-emitted. */
+	activeDelegateObjective?: string;
 }
 
 export interface MuseTurnOutcome {
@@ -1140,6 +1182,8 @@ export interface MuseTurnOutcome {
 	backendInterrupted?: boolean;
 	/** Set when a native delegation was taken over: run `objective` as an OMP `task` instead. */
 	delegateRedirect?: DelegateRedirect;
+	/** Set when a respawn matching the in-flight OMP task was stopped: the delegation stays in flight. */
+	duplicateSuppressed?: boolean;
 }
 
 const EMPTY_USAGE: MuseUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0, turns: 0 };
@@ -1189,6 +1233,7 @@ export async function runMuseTurn(args: MuseTurnArgs): Promise<MuseTurnOutcome> 
 		onReasoningDelta: args.onReasoningDelta, onActivityDelta: args.onActivityDelta,
 		onTodoSnapshot: args.onTodoSnapshot,
 		delegateViaOmp: delegateRedirectEnabled(),
+		activeDelegateObjective: args.activeDelegateObjective,
 	});
 	const turnCommand = uuidv7();
 	run.turnId = turnCommand;
@@ -1262,7 +1307,16 @@ export async function runMuseTurn(args: MuseTurnArgs): Promise<MuseTurnOutcome> 
 		if (!usage.turns) usage.turns = 1;
 		const backendInterrupted = !terminal.localAbort && terminal.terminal === "cancelled";
 		if (run.delegateRedirect && !args.signal?.aborted) {
-			return { output: run.finalText, usage, diagnostics: run.diagnostics, delegateRedirect: run.delegateRedirect };
+			return {
+				output: run.finalText, usage, diagnostics: run.diagnostics, delegateRedirect: run.delegateRedirect,
+				...(run.duplicateSuppressed ? { duplicateSuppressed: true as const } : {}),
+			};
+		}
+		if (run.duplicateSuppressed && !run.delegateRedirect && !args.signal?.aborted) {
+			return {
+				output: run.finalText || "Delegation already runs as an OMP task; awaiting its result instead of starting a duplicate.",
+				usage, diagnostics: run.diagnostics, duplicateSuppressed: true,
+			};
 		}
 		if (args.signal?.aborted || terminal.interrupted || terminal.terminal === "cancelled") {
 			return {

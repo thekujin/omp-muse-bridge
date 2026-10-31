@@ -85,6 +85,8 @@ interface MuseProviderSessionState extends Omit<StoredMuseSession, "updatedAt"> 
 	close(): void;
 	/** Held across an OMP tool loop after a delegate takeover: re-entry starts one fresh host turn. */
 	awaitingOmpResult?: boolean;
+	/** Delegation already running as an OMP `task`: matching respawns are stopped, never re-emitted. */
+	pendingDelegate?: { objective: string; toolCallId: string };
 }
 
 export interface MuseStreamSettings {
@@ -324,6 +326,8 @@ export function streamMuse(
 			if (sessionState) {
 				sessionState.initialized = true;
 				sessionState.checkpoint = contextCheckpoint(context.messages, context.messages.length, output);
+				// The tool result was consumed by a clean turn: the delegation is no longer in flight.
+				sessionState.pendingDelegate = undefined;
 				await persistSession(sessionState, diagnostic);
 			}
 			releaseSession();
@@ -363,6 +367,7 @@ export function streamMuse(
 						onReasoningDelta: options?.hideThinkingSummary ? undefined : (delta) => { if (delta) markFirstToken(); pushThinkingDelta(delta); },
 						onActivityDelta: pushThinkingDelta,
 						onTodoSnapshot: settings.onTodoSnapshot,
+						activeDelegateObjective: sessionState!.pendingDelegate?.objective,
 					});
 					let outcome: Awaited<ReturnType<typeof runMuseTurn>>;
 					try {
@@ -382,15 +387,18 @@ export function streamMuse(
 						closeOpenBlock();
 						recordDuration();
 						const taskIndex = output.content.length;
-						const taskCall = { type: "toolCall" as const, id: uuidv7(), name: "task", arguments: buildOmpTaskArgs(outcome.delegateRedirect) };
+						const toolCallId = uuidv7();
+						const taskCall = { type: "toolCall" as const, id: toolCallId, name: "task", arguments: buildOmpTaskArgs(outcome.delegateRedirect) };
 						output.content.push(taskCall);
 						output.stopReason = "toolUse";
 						stream.push({ type: "toolcall_start", contentIndex: taskIndex, partial: output });
 						stream.push({ type: "toolcall_end", contentIndex: taskIndex, toolCall: taskCall, partial: output });
 						// Hold the OMP session across the tool loop; re-entry starts one fresh host turn.
+						// The objective stays in flight so a Muse retry is stopped, never a second task.
 						sessionState.sessionId = uuidv7();
 						sessionState.initialized = false;
 						sessionState.awaitingOmpResult = true;
+						sessionState.pendingDelegate = { objective: outcome.delegateRedirect.objective, toolCallId };
 						await persistSession(sessionState, diagnostic);
 						sessionState = undefined;
 						stream.push({ type: "done", reason: "toolUse", message: output });
@@ -400,6 +408,22 @@ export function streamMuse(
 					if (outcome.errorMessage) {
 						if (outcome.aborted) output.stopReason = "aborted";
 						throw new Error(outcome.errorMessage);
+					}
+					if (outcome.duplicateSuppressed) {
+						// The OMP task still runs: keep the objective in flight so the
+						// next retry is stopped too, never a second task.
+						closeOpenBlock();
+						recordDuration();
+						output.stopReason = "stop";
+						if (sessionState) {
+							sessionState.initialized = true;
+							sessionState.checkpoint = contextCheckpoint(context.messages, context.messages.length, output);
+							await persistSession(sessionState, diagnostic);
+						}
+						releaseSession();
+						stream.push({ type: "done", reason: "stop", message: output });
+						stream.end();
+						return;
 					}
 					await finish();
 					return;
